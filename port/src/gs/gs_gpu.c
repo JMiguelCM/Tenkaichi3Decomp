@@ -769,6 +769,7 @@ static void vk_frame_end(void) {
         if (d->native == 4) { /* the ids as they are now (GfxPost_CopyAlphaToDepth): kept for the passes that index them */
             SDL_GPUCopyPass *cp;
             SDL_GPUTextureLocation from, to;
+            int rx, ry, rw, rh;
             if (pass != NULL) {
                 SDL_EndGPURenderPass(pass);
                 pass = NULL;
@@ -777,12 +778,17 @@ static void vk_frame_end(void) {
             if (!gsTargets[d->target].cleared) {
                 continue;
             }
+            if (!GsDraw_AuxRegion(n, &rx, &ry, &rw, &rh)) { /* only what the passes that follow read (gs_draw.c) */
+                continue;
+            }
             cp = SDL_BeginGPUCopyPass(cmd);
             SDL_zero(from);
             SDL_zero(to);
             from.texture = sTgAux[d->target];
+            from.x = to.x = (Uint32)rx;
+            from.y = to.y = (Uint32)ry;
             to.texture = sAuxCopy;
-            SDL_CopyGPUTextureToTexture(cp, &from, &to, GS_W * SCALE, GS_H * SCALE, 1, false);
+            SDL_CopyGPUTextureToTexture(cp, &from, &to, (Uint32)rw, (Uint32)rh, 1, false);
             SDL_EndGPUCopyPass(cp);
             continue;
         }
