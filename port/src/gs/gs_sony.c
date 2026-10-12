@@ -67,7 +67,9 @@ int sceGsPutDrawEnv(uint64_t *giftag) {
 }
 
 int sceGsSwapDBuff(void *p, int id) {
+    extern void Port_GsSyncPath(void); /* gs_core.c */
     DBuff *db = p;
+    Port_GsSyncPath(); /* (the render thread: the list being drawn still shows the buffer chosen before) */
     /* the buffer this frame is drawn into: what the renderer shows when the frame is finished */
     gGsMainFbp = (int)(((id & 1) ? db->draw1.frame.v : db->draw0.frame.v) & 0x1FF);
     return sceGsPutDrawEnv((id & 1) ? db->giftag1 : db->giftag0);

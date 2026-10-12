@@ -33,6 +33,12 @@ extern uint32_t gGsPageGen[512]; /* bumped whenever an upload writes into that 8
 extern unsigned gGsFrame;
 
 uint32_t Gs_PageHash(uint32_t page); /* content hash of an 8 KB page of GS memory */
+/* The render thread (gs_core.c, F1 Video "Draw on a second processor core"): 1 while the frame's list is drawn on a
+   thread of its own. What the renderer reads of the game's side is then read as it was when the list was handed
+   over: GS_MENU_MODE instead of gPortMenuMode (headless.c). Without the thread it is gPortMenuMode itself. */
+extern int gGsThreaded, gGsListMenuMode, gPortMenuMode;
+#define GS_MENU_MODE (gGsThreaded ? gGsListMenuMode : gPortMenuMode)
+void Port_GsSyncPath(void); /* the game's wait for the GS (sceGsSyncPath): waits for the render thread */
 uint32_t Gs_VramRead(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x, uint32_t y);
 /* The 256-byte block of GS memory that holds the pixel (x, y) of that buffer (formats 0x00, 0x13, 0x14). */
 const uint8_t *Gs_BlockPtr(uint32_t bp, uint32_t bw, uint32_t psm, uint32_t x, uint32_t y);

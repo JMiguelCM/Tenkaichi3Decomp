@@ -536,7 +536,7 @@ static void vk_frame_end(void) {
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) {
             if (!ev.key.repeat && !Ui_QuitAsk()) { exit(0); } /* (asks first) */
         }
-        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* in-between pictures on / off */
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9 && !gGsThreaded) { /* in-between pictures on / off (not with the render thread) */
             extern int gsInterp;
             extern void Port_SettingSave(const char *name, int value);
             extern void Port_SettingsWrite(void);
@@ -976,8 +976,8 @@ static void vk_frame_end(void) {
         {
             /* The picture keeps its shape whatever the window's: 4:3, or 16:9 in widescreen, centred, the rest
                black. (The 512 x 448 buffer is not square-pixelled: it always fills a 4:3 or 16:9 screen.) */
-            extern int Port_PageAspectMilli(void); /* plat_stub.c: 4:3 while the menus run, if asked for */
-            float want = (float)Port_PageAspectMilli() / 1000.0f;
+            extern int GsDraw_PageAspectMilli(void); /* gs_draw.c: 4:3 while the menus run, if asked for */
+            float want = (float)GsDraw_PageAspectMilli() / 1000.0f;
             Uint32 w = sw, h = sh;
             if ((float)sw > (float)sh * want) {
                 w = (Uint32)((float)sh * want + 0.5f);

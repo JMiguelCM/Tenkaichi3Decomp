@@ -2159,3 +2159,49 @@ outline's copy of the ids 0.3 ms; the shadow buffer 1.1 ms. These are the effect
 tab already turns off. The driver's buffer compression is not the cost (`RADV_DEBUG=nodcc,nohiz` changes nothing
 or is slower). Two measurements were thrown away: skipping "every buffer but the first" and "buffer 070" doubled
 the speed only because the game shows buffers 000 and 070 in turn, so every other frame was not drawn at all.
+
+## A weak machine in split screen: OpenGL's calls, uploads, texture decoding, the render thread (2026-10-12)
+
+Reported on a Xeon E3-1240 v2 with a Radeon RX 560 (2 GB), Windows: split screen dropped under 30 with many effects
+or hits; OpenGL ran better there than Vulkan. Nothing below changes the picture; each part was checked outside the
+game (no disc here), the game was run by the user.
+
+- **The ids' copy (native 4) only where it is read** (`GsDraw_AuxRegion`, like `GsDraw_DateRegion`): the union of
+  the scissors of the passes that read it, two GS pixels wider. It was the whole 1024 x 1024 target every time,
+  once per half in split screen. `BT3_AUX_WHOLE=1`: as before.
+- **OpenGL**: blend, write masks and depth state are sent only when they differ (`state_forget` wherever other code
+  touches them); the frame's `gsVuUni` go into one uniform buffer, each draw binding its range; every draw's Params
+  block likewise (worked out before the replay, consecutive equal ones shared); vertex, index and uniform buffers
+  are orphaned before they are rewritten. It was a `glBufferSubData` into the same small buffer for nearly every
+  draw. The user: no more drops under 30 with this (and the rest of the day's changes).
+- **Uploads by whole blocks** (`transfer_data`): where an upload covers a 256-byte block (32, 8 and 4 bits), the
+  block is written in memory order from the pixels the tables put there (4 bits: no read-back of the other half of
+  each byte). Only where no two pixels of the upload can land on the same place. `BT3_UPLOAD_PIXELS=1`: as before.
+- **Texture decoding** (`Gs_DecodeTexture`, from `texture_get`): the palette expanded once per texture, the common
+  formats read a row at a time with the upload tables. It was two `Gs_VramRead` and a `Gs_Expand` per pixel, for
+  every texture new to the cache, which includes every palette an effect animates. `BT3_TEX_PIXELS=1`: as before.
+
+Checked outside the game, old code against new with the release's compiler flags: about 500,000 random uploads
+(every format, size, position, buffer width, split of the data into runs) leave GS memory and the page generations
+identical, and three deliberate faults in the new code were each caught; 10,000 random textures of every format
+(depth formats and odd ones through the old path) decode to identical pixels. Measured there: uploads 2 to 5 times
+faster (4, 8, 32 bits; tiny palettes the same), decoding 4 to 10 times (16 bits 1.9).
+
+**The render thread, made safe** (now a setting: F1, Video, "Draw on a second processor core (experimental)", from
+the next start; `gs_thread`, or `BT3_GS_THREAD=1` / `0`):
+- The cause of the lists that changed while drawn: the thread read the list and everything its tags point at from
+  the game's memory while the game went on. The two list buffers are kept apart by the game, but not the data: at a
+  change of scene the game frees memory and loads the next scene over what the last list referred to. Now the list
+  and all its data are copied when it is handed over (`flat_copy`, the walk of `run_chain`), and the thread draws
+  the copy (`run_flat`). `BT3_GS_NOCOPY=1`: as before (with `BT3_GS_RACE`).
+- `sceGsSyncPath` was an empty stub; it now waits for the thread (`Port_GsSyncPath`), as the PS2's does: the game
+  waits there at the end of every frame (`Gfx_EndFrame`), so which buffer is shown next (`gGsMainFbp`, set by
+  `sceGsSwapDBuff`, which also waits now) no longer changes under a list being drawn. (Likely the 4-of-121 frames
+  that differed in the rightmost columns: the wide-screen placement reads it.)
+- The cross-fade's read-back (`Gs_StoreImage`) waits and runs its copy on the thread (`render_call`); it handed back
+  black before. Keeping and restoring the GS state wait; an online session draws each list before the game goes on.
+- The menu mode the renderer reads is the one the list was made in (`GS_MENU_MODE`, `gGsListMenuMode`).
+- Smooth motion is off while it is on (its pictures are shown from the game's thread); F1 says so, F9 does nothing.
+Checked outside the game: 3,000 random chains (CNT, NEXT, REF, REFS, CALL nested past the two-entry stack, RET,
+END, REFE; copy area and block list grown several times) give `vif` the same calls through the copy as through the
+walk; three faults in the copy were caught. Not checked: in the game, by anyone, at the time of writing.

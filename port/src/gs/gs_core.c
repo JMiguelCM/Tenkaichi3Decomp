@@ -45,6 +45,13 @@ unsigned gGsFrame;
 #define Vertex GsVertex
 #define sFrame gGsFrame
 static int sGpu; /* 1: the GPU back end draws (BT3_GS=gpu), 0: the software rasteriser below */
+/* The render thread (below): the GPU back end and the frame's list run on a thread of their own. Everything the
+   game's own thread does to the GS (uploads, its wait for the GS, a read-back, keeping the GS state) first waits for
+   that thread to be idle. gGsThreaded: the same, for the other files of the renderer. */
+static int sThreaded;
+int gGsThreaded;
+int gGsListMenuMode; /* gPortMenuMode when the list being drawn was handed over (GS_MENU_MODE, gs_internal.h) */
+static void render_wait(void);
 
 static Target sTargets[16];
 static int sTargetCount;
@@ -187,6 +194,9 @@ static uint32_t sMoved;
 
 void Gs_StateKeep(void) {
     extern void GsVu1_StateKeep(int restore); /* gs_vu1.c: the vertex unit's memory and programs */
+    if (sThreaded) {
+        render_wait(); /* (the render thread's list writes all of this) */
+    }
     if (sKept.vram == NULL) {
         sKept.vram = malloc(sizeof(sVram));
     }
@@ -200,6 +210,9 @@ void Gs_StateKeep(void) {
 void Gs_StateBack(void) {
     extern void GsVu1_StateKeep(int restore);
     int i;
+    if (sThreaded) {
+        render_wait();
+    }
     if (!sKept.valid) {
         return;
     }
@@ -1256,11 +1269,14 @@ static void screenshot(void) {
 static pthread_t sThread;
 static pthread_mutex_t sLock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sWake = PTHREAD_COND_INITIALIZER, sDone = PTHREAD_COND_INITIALIZER;
-static int sThreaded;
-static int sJob;            /* 0 none, 1 start the GPU back end, 2 run a list */
+static int sJob;            /* 0 none, 1 start the GPU back end, 2 run a list, 3 call a function (render_call) */
 static uint32_t sJobTadr;
-static int sJobTte, sInitResult;
+static int sJobTte, sInitResult, sJobFlat; /* sJobFlat: the list is the copy made by flat_copy */
+static void (*sJobFn)(void *);
+static void *sJobArg;
 static void run_chain(uint32_t tadr, int tte);
+static void run_flat(int tte);
+static int flat_copy(uint32_t tadr);
 
 /* BT3_GS_RACE=1 (with the render thread): finds data of a frame's list that the game changes while the list is
    being drawn. The list's blocks are hashed when the game hands the list over and again when the drawing is
@@ -1329,14 +1345,24 @@ static void *render_thread(void *arg) {
         }
         if (sJob == 1) {
             sInitResult = GsGpu_Init();
+        } else if (sJob == 3) { /* render_call: work the game's thread needs done where the graphics device lives */
+            void (*fn)(void *) = sJobFn;
+            void *a = sJobArg;
+            pthread_mutex_unlock(&sLock);
+            fn(a);
+            pthread_mutex_lock(&sLock);
         } else {
             uint32_t tadr = sJobTadr;
-            int tte = sJobTte;
+            int tte = sJobTte, flat = sJobFlat;
             pthread_mutex_unlock(&sLock);
-            run_chain(tadr, tte);
-            if (getenv("BT3_GS_RACE") != NULL) {
-                race_walk(tadr, 1);
-                race_compare();
+            if (flat) {
+                run_flat(tte);
+            } else {
+                run_chain(tadr, tte);
+                if (getenv("BT3_GS_RACE") != NULL) {
+                    race_walk(tadr, 1);
+                    race_compare();
+                }
             }
             pthread_mutex_lock(&sLock);
         }
@@ -1362,6 +1388,30 @@ static void render_post(int job, uint32_t tadr, int tte) {
     sJobTte = tte;
     pthread_cond_signal(&sWake);
     pthread_mutex_unlock(&sLock);
+}
+
+/* Runs fn(arg) on the render thread once it is idle, and waits for it (the graphics device belongs to it). */
+static void render_call(void (*fn)(void *), void *arg) {
+    render_wait();
+    pthread_mutex_lock(&sLock);
+    sJobFn = fn;
+    sJobArg = arg;
+    sJob = 3;
+    pthread_cond_signal(&sWake);
+    while (sJob != 0) {
+        pthread_cond_wait(&sDone, &sLock);
+    }
+    pthread_mutex_unlock(&sLock);
+}
+
+/* The game waits for the GS to finish what it was sent (sceGsSyncPath, plat_stub.c; sceGsSwapDBuff, gs_sony.c). On
+   one thread the lists have been carried out already. With the render thread this is the wait: it keeps the
+   game's frame-end work (which buffer is shown next, the clear) from overtaking the list being drawn, as the
+   PS2's own wait does. */
+void Port_GsSyncPath(void) {
+    if (sThreaded) {
+        render_wait();
+    }
 }
 
 static uint64_t now_ns(void) {
@@ -1427,12 +1477,16 @@ static int gs_on(void) {
         if (on && strcmp(gs_mode(), "gpu") == 0) {
             /* BT3_GS_THREAD=1: the back end and the list run on the render thread (experimental: the game was seen
                to change data a list still refers to, which shows as a jumping camera). Default: this thread. */
-            sThreaded = getenv("BT3_GS_THREAD") != NULL;
+            extern int Port_Setting(const char *name, int def); /* plat_settings.c */
+            sThreaded = getenv("BT3_GS_THREAD") != NULL ? atoi(getenv("BT3_GS_THREAD")) != 0 || getenv("BT3_GS_THREAD")[0] == '\0'
+                                                         : Port_Setting("gs_thread", 0) != 0; /* (F1, Video) */
             if (sThreaded) {
                 pthread_create(&sThread, NULL, render_thread, NULL);
                 render_post(1, 0, 0);
                 render_wait();
                 sGpu = sInitResult;
+                gGsThreaded = sGpu != 0;
+                fprintf(stderr, "bt3: drawing on a thread of its own%s\n", getenv("BT3_GS_NOCOPY") != NULL ? " (lists not copied)" : "");
             } else {
                 sGpu = GsGpu_Init();
             }
@@ -1553,11 +1607,122 @@ void Port_GsVif1Chain(uint32_t tadr, int tte) {
     }
     start = t;
     if (sThreaded) {
-        if (getenv("BT3_GS_RACE") != NULL) {
+        extern int Port_NetSession(void); /* gs/net.c */
+        extern int gPortMenuMode;         /* headless.c */
+        int nocopy = getenv("BT3_GS_NOCOPY") != NULL, flat = !nocopy && flat_copy(tadr);
+        if (nocopy && getenv("BT3_GS_RACE") != NULL) {
             race_walk(tadr, 0);
         }
+        gGsListMenuMode = gPortMenuMode; /* the game's side as it was when this list was made (the renderer reads it) */
+        sJobFlat = flat; /* (the thread is idle: waited for above) */
         render_post(2, tadr, tte);
+        if ((!nocopy && !flat) || Port_NetSession()) {
+            /* Not copied (out of memory), or an online session (frames run again after a rollback, the state kept
+               and put back): the list is drawn before the game goes on, as without the thread. */
+            render_wait();
+        }
     }
+}
+
+static void chain_end(void);
+
+/* ---- The render thread's own copy of a frame's list.
+   The thread read the list from the game's memory while the game went on. The game's own wait for the GS keeps its
+   two list buffers apart, but not everything the lists point at: at a change of scene the game frees its memory and
+   loads the next scene's data over what the last list still referred to (seen: lists that changed while drawn, all
+   in menus and loading, and a vertex program made of garbage where a fight begins). Now, when the game hands a list
+   over, the list and all the data its tags point at are copied, block by block in the order run_chain reads them,
+   and the thread draws the copy: the game's memory is not read by it at all. BT3_GS_NOCOPY=1: as before. */
+typedef struct {
+    const uint32_t *tag; /* where the tag was (for BT3_GS_DUMP) */
+    uint32_t vif[2], qwc, id, addr, sp;
+    size_t off; /* the block's data in sArena */
+} FlatBlock;
+static FlatBlock *sFlat;
+static uint32_t sFlatCount, sFlatCap;
+static uint8_t *sArena;
+static size_t sArenaCap;
+
+/* Copies the chain at `tadr` (the same walk as run_chain). 0: out of memory (the list is then drawn from the
+   game's memory, waited for). */
+static int flat_copy(uint32_t tadr) {
+    uint32_t stack[2], sp = 0;
+    size_t used = 0;
+    int guard;
+
+    sFlatCount = 0;
+    for (guard = 0; guard < 100000; guard++) {
+        const uint32_t *tag = (const uint32_t *)(uintptr_t)tadr;
+        uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1];
+        const uint32_t *data;
+        FlatBlock *b;
+        int end = 0;
+
+        switch (id) {
+        case 0: data = (const uint32_t *)(uintptr_t)addr; end = 1; break;
+        case 1: data = tag + 4; tadr += 16 + qwc * 16; break;
+        case 2: data = tag + 4; tadr = addr; break;
+        case 3: case 4: data = (const uint32_t *)(uintptr_t)addr; tadr += 16; break;
+        case 5: data = tag + 4; if (sp < 2) { stack[sp++] = tadr + 16 + qwc * 16; } tadr = addr; break;
+        case 6: data = tag + 4; if (sp > 0) { tadr = stack[--sp]; } else { end = 1; } break;
+        default: data = tag + 4; end = 1; break;
+        }
+        if (sFlatCount == sFlatCap) {
+            uint32_t cap = sFlatCap ? sFlatCap * 2 : 4096;
+            FlatBlock *n = realloc(sFlat, cap * sizeof(FlatBlock));
+            if (n == NULL) {
+                return 0;
+            }
+            sFlat = n;
+            sFlatCap = cap;
+        }
+        if (used + (size_t)qwc * 16 > sArenaCap) {
+            size_t cap = sArenaCap ? sArenaCap : 8u << 20;
+            uint8_t *n;
+            while (cap < used + (size_t)qwc * 16) {
+                cap *= 2;
+            }
+            n = realloc(sArena, cap);
+            if (n == NULL) {
+                return 0;
+            }
+            sArena = n;
+            sArenaCap = cap;
+        }
+        b = &sFlat[sFlatCount++];
+        b->tag = tag;
+        b->vif[0] = tag[2];
+        b->vif[1] = tag[3];
+        b->qwc = qwc;
+        b->id = id;
+        b->addr = addr;
+        b->sp = sp;
+        b->off = used;
+        memcpy(sArena + used, data, (size_t)qwc * 16);
+        used += (size_t)qwc * 16;
+        if (end) {
+            break;
+        }
+    }
+    return 1;
+}
+
+/* Executes a list copied by flat_copy: the same calls as run_chain, on the copy. */
+static void run_flat(int tte) {
+    uint32_t k;
+
+    for (k = 0; k < sFlatCount; k++) {
+        const FlatBlock *b = &sFlat[k];
+        if (sDumpFrame == (int)sFrame) {
+            fprintf(stderr, "  dma tag at %08x: id %u qwc %u addr %08x | %08x %08x (depth %u)\n", (unsigned)(uintptr_t)b->tag, b->id, b->qwc, b->addr, b->vif[0], b->vif[1], b->sp);
+        }
+        sStat[0]++;
+        if (tte) {
+            vif(b->vif, 2);
+        }
+        vif((const uint32_t *)(sArena + b->off), b->qwc * 4);
+    }
+    chain_end();
 }
 
 /* Executes one frame's list: the DMA chain at `tadr` on VIF1, then the end-of-frame work of the back end. */
@@ -1592,6 +1757,11 @@ static void run_chain(uint32_t tadr, int tte) {
             break;
         }
     }
+    chain_end();
+}
+
+/* The end of a frame's list (run_chain, run_flat): statistics, the back end's frame end, the screenshot. */
+static void chain_end(void) {
     if (getenv("BT3_GS_VERBOSE") != NULL && (sFrame < 4 || sFrame % 60 == 0)) {
         fprintf(stderr, "gs: frame %u: %u DMA tags, %u VIF codes, %u DIRECT qwords, %u GIF tags, %u register writes, %u vertices, "
                         "%u image qwords, %d targets\n", sFrame, sStat[0], sStat[1], sStat[2], sStat[3], sStat[4], sStat[5],
@@ -1628,8 +1798,30 @@ static void run_chain(uint32_t tadr, int tte) {
      - GPU back end: the frame buffer's picture is read from the card once and kept for the calls that follow in the
        same frame (two halves), reduced to the GS's 512 x 448;
      - nothing drawn (tests) or the back end on a thread of its own: black, and the game is not told otherwise. */
+/* The two read-backs below run where the graphics device lives: on the render thread when there is one. */
+extern int GsGpu_ReadFrame(uint32_t fbp, uint8_t *rgba); /* gs_draw.c */
+extern int GsGpu_Snapshot(uint32_t fbp);
+typedef struct { uint32_t fbp; uint8_t *rgba; int result; } GpuReadArgs;
+static void snapshot_job(void *p) { GpuReadArgs *a = p; a->result = GsGpu_Snapshot(a->fbp); }
+static void read_job(void *p) { GpuReadArgs *a = p; a->result = GsGpu_ReadFrame(a->fbp, a->rgba); }
+static int gpu_snapshot(uint32_t fbp) {
+    GpuReadArgs a = {fbp, NULL, 0};
+    if (!sThreaded) {
+        return GsGpu_Snapshot(fbp);
+    }
+    render_call(snapshot_job, &a);
+    return a.result;
+}
+static int gpu_read_frame(uint32_t fbp, uint8_t *rgba) {
+    GpuReadArgs a = {fbp, rgba, 0};
+    if (!sThreaded) {
+        return GsGpu_ReadFrame(fbp, rgba);
+    }
+    render_call(read_job, &a);
+    return a.result;
+}
+
 void Gs_StoreImage(unsigned bp, unsigned w, unsigned h, unsigned char *rgb) {
-    extern int GsGpu_ReadFrame(uint32_t fbp, uint8_t *rgba); /* gs_draw.c */
     static uint8_t kept[512 * 448 * 4];
     static unsigned keptFrame = ~0u, keptFbp = ~0u;
     unsigned fbp = bp / 0xE00 * 0x70, y0 = bp % 0xE00 / 8, x, y;
@@ -1641,18 +1833,19 @@ void Gs_StoreImage(unsigned bp, unsigned w, unsigned h, unsigned char *rgb) {
     }
     if (sGpu) {
         if (sThreaded) {
-            return;
+            /* The game reads back what its last list drew: that list is finished first. (The thread used to hand
+               back black here, and the cross-fade of a fight's scenes started from black.) */
+            render_wait();
         }
         {
             /* First choice: the frame stays on the card as it was drawn and the cross-fade draws from that (the
                game is handed black, which it uploads and never shows). BT3_XFADE_READ=1: the game's own way. */
-            extern int GsGpu_Snapshot(uint32_t fbp);
             static unsigned snapFrame = ~0u, snapFbp = ~0u;
             if (getenv("BT3_XFADE_READ") == NULL) {
                 if (snapFrame == sFrame && snapFbp == fbp) {
                     return;
                 }
-                if (GsGpu_Snapshot(fbp)) {
+                if (gpu_snapshot(fbp)) {
                     snapFrame = sFrame;
                     snapFbp = fbp;
                     return;
@@ -1660,7 +1853,7 @@ void Gs_StoreImage(unsigned bp, unsigned w, unsigned h, unsigned char *rgb) {
             }
         }
         if (keptFrame != sFrame || keptFbp != fbp) {
-            if (!GsGpu_ReadFrame(fbp, kept)) {
+            if (!gpu_read_frame(fbp, kept)) {
                 return;
             }
             keptFrame = sFrame;
