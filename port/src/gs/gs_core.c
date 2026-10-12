@@ -328,6 +328,71 @@ uint32_t Gs_Expand(uint32_t c, uint32_t psm) {
     }
 }
 
+/* A texture decoded from GS memory: px[y * tw + x] = what Gs_Expand(Gs_VramRead(...)) gives for each pixel (through
+   the palette at cbp for 8 and 4 bits, as texture_get in gs_draw.c read it), the same values. It read every pixel
+   with two calls (the index, then its palette entry), for every texture the cache did not have: a texture new to
+   the frame, or one whose palette changed (effects animate theirs). Now the palette is expanded once per texture
+   and the formats textures come in are read a row at a time with the upload's tables. */
+void Gs_DecodeTexture(uint32_t *px, uint32_t tbp, uint32_t tbw, uint32_t psm, uint32_t tw, uint32_t th, uint32_t cbp, uint32_t cpsm) {
+    const uint8_t *vram8 = (const uint8_t *)sVram;
+    const uint16_t *vram16 = (const uint16_t *)sVram;
+    uint32_t bits = (uint32_t)Gs_PsmBits(psm), bw = tbw ? tbw : 1, pal[256], x, y;
+    /* Gs_Expand's TEXA fields, for the 24 and 16-bit formats below (the same arithmetic, without a call a pixel) */
+    uint32_t ta0 = gs.texa & 0xFF, ta1 = (gs.texa >> 32) & 0xFF, aem = (gs.texa >> 15) & 1;
+
+    if (bits == 8) {
+        for (x = 0; x < 256; x++) {
+            uint32_t c = (x & 0xE7) | ((x & 8) << 1) | ((x & 0x10) >> 1); /* (the GS's order of a 256-colour table) */
+            pal[x] = Gs_Expand(vram_rw(cbp, 1, cpsm, c & 15, c >> 4, 0, 0), cpsm);
+        }
+    } else if (bits == 4) {
+        for (x = 0; x < 16; x++) {
+            pal[x] = Gs_Expand(vram_rw(cbp, 1, cpsm, x & 7, x >> 3, 0, 0), cpsm);
+        }
+    }
+    for (y = 0; y < th; y++) {
+        uint32_t *out = px + (size_t)y * tw;
+        if (psm == 0x13) {
+            const uint16_t *in = sIn8[y & 63];
+            uint32_t base = (tbp + (y >> 6) * 32 * (bw >> 1)) << 8;
+            for (x = 0; x < tw; x++) {
+                out[x] = pal[vram8[(base + ((x >> 7) << 13) + in[x & 127]) & 0x3FFFFF]];
+            }
+        } else if (psm == 0x14) {
+            const uint16_t *in = sIn4[y & 127];
+            uint32_t base = (tbp + (y >> 7) * 32 * (bw >> 1)) << 9;
+            for (x = 0; x < tw; x++) {
+                uint32_t a = base + ((x >> 7) << 14) + in[x & 127];
+                out[x] = pal[(vram8[(a >> 1) & 0x3FFFFF] >> ((a & 1) * 4)) & 15];
+            }
+        } else if (psm == 0x00 || psm == 0x01) {
+            const uint16_t *in = sIn32[y & 31];
+            uint32_t base = (tbp + (y >> 5) * 32 * bw) << 6;
+            for (x = 0; x < tw; x++) {
+                uint32_t c = sVram[(base + ((x >> 6) << 11) + in[x & 63]) & 0xFFFFF];
+                if (psm == 0x01) {
+                    c &= 0xFFFFFF;
+                    c |= (aem && c == 0 ? 0 : ta0) << 24;
+                }
+                out[x] = c;
+            }
+        } else if (psm == 0x02 || psm == 0x0A) {
+            const uint16_t *in = sIn16[psm == 0x0A][y & 63];
+            uint32_t base = (tbp + (y >> 6) * 32 * bw) << 7;
+            for (x = 0; x < tw; x++) {
+                uint32_t c = vram16[(base + ((x >> 6) << 12) + in[x & 63]) & 0x1FFFFF];
+                uint32_t a = (c & 0x8000) ? ta1 : (aem && (c & 0x7FFF) == 0 ? 0 : ta0);
+                out[x] = (c & 31) << 3 | (((c >> 5) & 31) << 3) << 8 | (((c >> 10) & 31) << 3) << 16 | a << 24;
+            }
+        } else { /* the rest (the top byte or nibble of 32 bits, depth buffers read as textures): as before */
+            for (x = 0; x < tw; x++) {
+                uint32_t c = vram_rw(tbp, tbw, psm, x, y, 0, 0);
+                out[x] = bits > 8 ? Gs_Expand(c, psm) : pal[c];
+            }
+        }
+    }
+}
+
 static uint32_t texel(int ctx, int u, int v) {
     uint64_t t0 = gs.tex0[ctx], cl = gs.clamp[ctx];
     uint32_t tbp = t0 & 0x3FFF, tbw = (t0 >> 14) & 0x3F, psm = (t0 >> 20) & 0x3F, tw = 1u << ((t0 >> 26) & 15), th = 1u << ((t0 >> 30) & 15);
@@ -701,6 +766,94 @@ static void transfer_begin(void) {
     }
 }
 
+/* A run of `run` pixels of row y from x on, the call's pixels from `k` on: the formats textures and palettes come
+   in, with the tables (the same writes as vram_rw makes). */
+static void put_run(const uint8_t *p, uint32_t k, uint32_t y, uint32_t x, uint32_t run, uint32_t dbp, uint32_t bw, uint32_t dpsm) {
+    uint8_t *vram8 = (uint8_t *)sVram; /* (little-endian hosts only, as everything here) */
+    uint16_t *vram16 = (uint16_t *)sVram;
+    uint32_t j;
+
+    if (dpsm == 0x13) {
+        const uint16_t *in = sIn8[y & 63];
+        uint32_t base = (dbp + (y >> 6) * 32 * (bw >> 1)) << 8;
+        for (j = 0; j < run; j++, x++) {
+            vram8[(base + ((x >> 7) << 13) + in[x & 127]) & 0x3FFFFF] = p[k + j];
+        }
+    } else if (dpsm == 0x14) {
+        const uint16_t *in = sIn4[y & 127];
+        uint32_t base = (dbp + (y >> 7) * 32 * (bw >> 1)) << 9;
+        for (j = 0; j < run; j++, x++) {
+            uint32_t a = base + ((x >> 7) << 14) + in[x & 127], kk = k + j;
+            uint8_t *b = &vram8[(a >> 1) & 0x3FFFFF];
+            uint32_t c = (p[kk >> 1] >> ((kk & 1) * 4)) & 15;
+            *b = (a & 1) ? (uint8_t)((*b & 0x0F) | c << 4) : (uint8_t)((*b & 0xF0) | c);
+        }
+    } else if (dpsm == 0x00) {
+        const uint16_t *in = sIn32[y & 31];
+        uint32_t base = (dbp + (y >> 5) * 32 * bw) << 6;
+        for (j = 0; j < run; j++, x++) {
+            memcpy(&sVram[(base + ((x >> 6) << 11) + in[x & 63]) & 0xFFFFF], &p[(k + j) * 4], 4);
+        }
+    } else {
+        const uint16_t *in = sIn16[dpsm == 0x0A][y & 63];
+        uint32_t base = (dbp + (y >> 6) * 32 * bw) << 7;
+        for (j = 0; j < run; j++, x++) {
+            memcpy(&vram16[(base + ((x >> 6) << 12) + in[x & 63]) & 0x1FFFFF], &p[(k + j) * 2], 2);
+        }
+    }
+}
+
+/* Whole blocks at once (32, 8 and 4 bits). A block is 256 bytes of GS memory: 8 x 8 pixels of 32 bits, 16 x 16 of
+   8, 32 x 16 of 4. Where an upload covers a block completely, its 256 bytes are written in order, each from the
+   pixel the tables put there (sInv*: which pixel of the block a place holds; sOff*: that pixel's place in the
+   upload, for the upload's width), instead of the pixels one by one in the order they come: for 4 bits that also
+   saves reading every byte back to keep its other half. Only taken where no two pixels of the upload land on the
+   same place (the rectangle within the buffer's width, nothing past the end of GS memory), so the order of the
+   writes cannot matter and GS memory ends up exactly as the pixel-by-pixel writes leave it. BT3_UPLOAD_PIXELS=1
+   writes pixel by pixel as before (to compare). */
+static uint8_t sInv8[256][2], sInv4[512][2], sInv32[64][2]; /* x, y in the block */
+static uint32_t sOff8[256], sOff4[512], sOff32[64];
+static uint32_t sOffTw[3] = {~0u, ~0u, ~0u};
+static int sInvReady;
+
+static void inv_init(void) {
+    int y, x;
+    sInvReady = 1;
+    for (y = 0; y < 16; y++) {
+        for (x = 0; x < 16; x++) { sInv8[sCol8[y][x]][0] = (uint8_t)x, sInv8[sCol8[y][x]][1] = (uint8_t)y; }
+        for (x = 0; x < 32; x++) { sInv4[sCol4[y][x]][0] = (uint8_t)x, sInv4[sCol4[y][x]][1] = (uint8_t)y; }
+    }
+    for (y = 0; y < 8; y++) {
+        for (x = 0; x < 8; x++) { sInv32[kCol32[y][x]][0] = (uint8_t)x, sInv32[kCol32[y][x]][1] = (uint8_t)y; }
+    }
+}
+
+/* 0: pixel by pixel; otherwise the block's width (its height: 8 for 32 bits, else 16). */
+static uint32_t blocks_ok(uint32_t dpsm, uint32_t dbp, uint32_t bw) {
+    static int off = -1;
+    uint32_t perRow, pw, ph, bwPix, maxPage;
+    if (off < 0) {
+        off = getenv("BT3_UPLOAD_PIXELS") != NULL;
+    }
+    if (off) {
+        return 0;
+    }
+    switch (dpsm) {
+    case 0x00: perRow = bw, pw = 64, ph = 32, bwPix = 8; break;
+    case 0x13: perRow = bw >> 1, pw = 128, ph = 64, bwPix = 16; break;
+    case 0x14: perRow = bw >> 1, pw = 128, ph = 128, bwPix = 32; break;
+    default: return 0;
+    }
+    if (perRow == 0 || gs.tx + gs.tw > perRow * pw) {
+        return 0; /* past the buffer's width: rows land on each other's pages */
+    }
+    maxPage = ((gs.ty + gs.th - 1) / ph) * perRow + (gs.tx + gs.tw - 1) / pw;
+    if (dbp + maxPage * 32 + 31 >= 16384) {
+        return 0; /* past the end of GS memory: it wraps round */
+    }
+    return bwPix;
+}
+
 static void transfer_data(const uint8_t *p, uint32_t bytes) {
     uint32_t dbp = (gs.bitbltbuf >> 32) & 0x3FFF, dbw = (gs.bitbltbuf >> 48) & 0x3F, dpsm = (gs.bitbltbuf >> 56) & 0x3F;
     uint32_t bits, total, i;
@@ -720,46 +873,70 @@ static void transfer_data(const uint8_t *p, uint32_t bytes) {
     bits = (uint32_t)Gs_PsmBits(dpsm);
     total = gs.tw * gs.th;
     /* The formats textures and palettes come in, a row at a time with the tables (the game uploads the stage's
-       textures again and again in every frame: this loop was a quarter of the renderer's time). The same writes
-       as vram_rw makes. */
+       textures again and again in every frame: this loop was a quarter of the renderer's time), and whole blocks
+       at once where the rows of a band of blocks are all here (above). */
     i = 0;
     if (dpsm == 0x00 || dpsm == 0x02 || dpsm == 0x0A || dpsm == 0x13 || dpsm == 0x14) {
         uint32_t bw = dbw ? dbw : 1, count = bytes * 8 / bits;
-        uint8_t *vram8 = (uint8_t *)sVram; /* (little-endian hosts only, as everything here) */
-        uint16_t *vram16 = (uint16_t *)sVram;
+        uint32_t BW = blocks_ok(dpsm, dbp, bw), BH = dpsm == 0x00 ? 8 : 16;
+        uint8_t *vram8 = (uint8_t *)sVram;
+        if (BW != 0) {
+            int f = dpsm == 0x00 ? 0 : dpsm == 0x13 ? 1 : 2;
+            if (!sInvReady) {
+                inv_init();
+            }
+            if (sOffTw[f] != gs.tw) { /* the places in the upload of a block's pixels, for this width */
+                uint32_t k;
+                sOffTw[f] = gs.tw;
+                if (f == 0) { for (k = 0; k < 64; k++) { sOff32[k] = sInv32[k][1] * gs.tw + sInv32[k][0]; } }
+                else if (f == 1) { for (k = 0; k < 256; k++) { sOff8[k] = sInv8[k][1] * gs.tw + sInv8[k][0]; } }
+                else { for (k = 0; k < 512; k++) { sOff4[k] = sInv4[k][1] * gs.tw + sInv4[k][0]; } }
+            }
+        }
         while (i < count && gs.tpos < total) {
-            uint32_t col = gs.tpos % gs.tw, y = gs.ty + gs.tpos / gs.tw, x = gs.tx + col, run = gs.tw - col, j;
+            uint32_t col = gs.tpos % gs.tw, row = gs.tpos / gs.tw, y = gs.ty + row, x = gs.tx + col, run = gs.tw - col;
+            if (BW != 0 && col == 0 && (y & (BH - 1)) == 0 && row + BH <= gs.th && count - i >= BH * gs.tw) {
+                /* a band of BH whole rows, its top on a block boundary: whole blocks, and the pixels beside them */
+                uint32_t x0 = (gs.tx + BW - 1) & ~(BW - 1), x1 = (gs.tx + gs.tw) & ~(BW - 1), r, bx;
+                if (x0 < x1) {
+                    for (r = 0; r < BH; r++) {
+                        if (x0 > gs.tx) {
+                            put_run(p, i + r * gs.tw, y + r, gs.tx, x0 - gs.tx, dbp, bw, dpsm);
+                        }
+                        if (gs.tx + gs.tw > x1) {
+                            put_run(p, i + r * gs.tw + (x1 - gs.tx), y + r, x1, gs.tx + gs.tw - x1, dbp, bw, dpsm);
+                        }
+                    }
+                    for (bx = x0; bx < x1; bx += BW) {
+                        uint32_t s = i + (bx - gs.tx), k; /* the block's first pixel among the call's */
+                        if (dpsm == 0x13) {
+                            uint8_t *d = &vram8[(((dbp + (y >> 6) * 32 * (bw >> 1)) << 8) + ((bx >> 7) << 13) + ((uint32_t)kBlock32[(y >> 4) & 3][(bx >> 4) & 7] << 8)) & 0x3FFFFF];
+                            const uint8_t *src = p + s;
+                            for (k = 0; k < 256; k++) {
+                                d[k] = src[sOff8[k]];
+                            }
+                        } else if (dpsm == 0x14) {
+                            uint8_t *d = &vram8[((((dbp + (y >> 7) * 32 * (bw >> 1)) << 9) + ((bx >> 7) << 14) + ((uint32_t)kBlock16[(y >> 4) & 7][(bx >> 5) & 3] << 9)) >> 1) & 0x3FFFFF];
+                            for (k = 0; k < 256; k++) {
+                                uint32_t a = s + sOff4[2 * k], b = s + sOff4[2 * k + 1];
+                                d[k] = (uint8_t)(((p[a >> 1] >> ((a & 1) * 4)) & 15) | ((p[b >> 1] >> ((b & 1) * 4)) & 15) << 4);
+                            }
+                        } else {
+                            uint32_t *d = &sVram[(((dbp + (y >> 5) * 32 * bw) << 6) + ((bx >> 6) << 11) + ((uint32_t)kBlock32[(y >> 3) & 3][(bx >> 3) & 7] << 6)) & 0xFFFFF];
+                            for (k = 0; k < 64; k++) {
+                                memcpy(&d[k], &p[(s + sOff32[k]) * 4], 4);
+                            }
+                        }
+                    }
+                    i += BH * gs.tw;
+                    gs.tpos += BH * gs.tw;
+                    continue;
+                }
+            }
             if (run > count - i) {
                 run = count - i;
             }
-            if (dpsm == 0x13) {
-                const uint16_t *in = sIn8[y & 63];
-                uint32_t base = (dbp + (y >> 6) * 32 * (bw >> 1)) << 8;
-                for (j = 0; j < run; j++, x++) {
-                    vram8[(base + ((x >> 7) << 13) + in[x & 127]) & 0x3FFFFF] = p[i + j];
-                }
-            } else if (dpsm == 0x14) {
-                const uint16_t *in = sIn4[y & 127];
-                uint32_t base = (dbp + (y >> 7) * 32 * (bw >> 1)) << 9;
-                for (j = 0; j < run; j++, x++) {
-                    uint32_t a = base + ((x >> 7) << 14) + in[x & 127], k = i + j;
-                    uint8_t *b = &vram8[(a >> 1) & 0x3FFFFF];
-                    uint32_t c = (p[k >> 1] >> ((k & 1) * 4)) & 15;
-                    *b = (a & 1) ? (uint8_t)((*b & 0x0F) | c << 4) : (uint8_t)((*b & 0xF0) | c);
-                }
-            } else if (dpsm == 0x00) {
-                const uint16_t *in = sIn32[y & 31];
-                uint32_t base = (dbp + (y >> 5) * 32 * bw) << 6;
-                for (j = 0; j < run; j++, x++) {
-                    memcpy(&sVram[(base + ((x >> 6) << 11) + in[x & 63]) & 0xFFFFF], &p[(i + j) * 4], 4);
-                }
-            } else {
-                const uint16_t *in = sIn16[dpsm == 0x0A][y & 63];
-                uint32_t base = (dbp + (y >> 6) * 32 * bw) << 7;
-                for (j = 0; j < run; j++, x++) {
-                    memcpy(&vram16[(base + ((x >> 6) << 12) + in[x & 63]) & 0x1FFFFF], &p[(i + j) * 2], 2);
-                }
-            }
+            put_run(p, i, y, x, run, dbp, bw, dpsm);
             i += run;
             gs.tpos += run;
         }

@@ -40,6 +40,8 @@ extern unsigned gGsFbUploads;
 void GsGpu_FbUpload(int second);
 int Gs_PsmBits(uint32_t psm);
 uint32_t Gs_Expand(uint32_t c, uint32_t psm); /* stored colour -> R | G << 8 | B << 16 | A << 24 */
+/* A texture of GS memory as colours (through its palette for 8 and 4 bits): Gs_Expand(Gs_VramRead) of every pixel */
+void Gs_DecodeTexture(uint32_t *px, uint32_t tbp, uint32_t tbw, uint32_t psm, uint32_t tw, uint32_t th, uint32_t cbp, uint32_t cpsm);
 
 void Gs_Gif(const uint8_t *p, uint32_t qwc); /* GIF data for the GS (from VIF1 DIRECT or a VU1 kick) */
 

@@ -248,9 +248,15 @@ static GsTex texture_get(int ctx) {
         }
     }
     px = replaced ? NULL : malloc((size_t)tw * th * 4);
-    for (y = 0; !replaced && y < th; y++) {
+    /* Alpha is kept as the GS has it (0x80 = opaque, up to 0xFF): the shader rescales it. Values above 0x80 matter:
+       the see-through pass gives palettes alpha 0xF9 to write an id. BT3_TEX_PIXELS=1 decodes pixel by pixel as
+       before (to compare). */
+    if (!replaced && px != NULL && getenv("BT3_TEX_PIXELS") == NULL) {
+        Gs_DecodeTexture(px, tbp, tbw, psm, tw, th, cbp, cpsm);
+    }
+    for (y = 0; !replaced && px != NULL && getenv("BT3_TEX_PIXELS") != NULL && y < th; y++) {
         for (x = 0; x < tw; x++) {
-            uint32_t c = Gs_VramRead(tbp, tbw, psm, x, y), a;
+            uint32_t c = Gs_VramRead(tbp, tbw, psm, x, y);
             if (bits > 8) {
                 c = Gs_Expand(c, psm);
             } else if (bits == 8) {
@@ -259,8 +265,6 @@ static GsTex texture_get(int ctx) {
             } else {
                 c = Gs_Expand(Gs_VramRead(cbp, 1, cpsm, c & 7, c >> 3), cpsm);
             }
-            (void)a; /* alpha is kept as the GS has it (0x80 = opaque, up to 0xFF): the shader rescales it. Values
-                        above 0x80 matter: the see-through pass gives palettes alpha 0xF9 to write an id */
             px[y * tw + x] = c;
         }
     }
