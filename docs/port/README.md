@@ -2164,7 +2164,7 @@ the speed only because the game shows buffers 000 and 070 in turn, so every othe
 
 Reported on a Xeon E3-1240 v2 with a Radeon RX 560 (2 GB), Windows: split screen dropped under 30 with many effects
 or hits; OpenGL ran better there than Vulkan. Nothing below changes the picture; each part was checked outside the
-game (no disc here), the game was run by the user.
+game (no disc here); what the user saw in the game is said where it was seen.
 
 - **The ids' copy (native 4) only where it is read** (`GsDraw_AuxRegion`, like `GsDraw_DateRegion`): the union of
   the scissors of the passes that read it, two GS pixels wider. It was the whole 1024 x 1024 target every time,
@@ -2173,7 +2173,8 @@ game (no disc here), the game was run by the user.
   touches them); the frame's `gsVuUni` go into one uniform buffer, each draw binding its range; every draw's Params
   block likewise (worked out before the replay, consecutive equal ones shared); vertex, index and uniform buffers
   are orphaned before they are rewritten. It was a `glBufferSubData` into the same small buffer for nearly every
-  draw. The user: no more drops under 30 with this (and the rest of the day's changes).
+  draw. The user, with the first two of these (state, uniform buffer) and the ids' copy: no more drops under 30.
+  The Params block came after.
 - **Uploads by whole blocks** (`transfer_data`): where an upload covers a 256-byte block (32, 8 and 4 bits), the
   block is written in memory order from the pixels the tables put there (4 bits: no read-back of the other half of
   each byte). Only where no two pixels of the upload can land on the same place. `BT3_UPLOAD_PIXELS=1`: as before.
@@ -2185,7 +2186,8 @@ Checked outside the game, old code against new with the release's compiler flags
 (every format, size, position, buffer width, split of the data into runs) leave GS memory and the page generations
 identical, and three deliberate faults in the new code were each caught; 10,000 random textures of every format
 (depth formats and odd ones through the old path) decode to identical pixels. Measured there: uploads 2 to 5 times
-faster (4, 8, 32 bits; tiny palettes the same), decoding 4 to 10 times (16 bits 1.9).
+faster (4, 8, 32 bits; tiny palettes the same), decoding 4 to 10 times (16 bits 1.9). Not yet run in the game at
+the time of writing.
 
 **The render thread, made safe** (now a setting: F1, Video, "Draw on a second processor core (experimental)", from
 the next start; `gs_thread`, or `BT3_GS_THREAD=1` / `0`):
