@@ -70,6 +70,7 @@ typedef void GLvoid; typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; t
     X(glGetUniformBlockIndex, GLuint, (GLuint, const GLchar *), (GLuint, const GLchar *)) \
     X(glUniformBlockBinding, void, (GLuint, GLuint, GLuint), (GLuint, GLuint, GLuint)) \
     X(glBindBufferBase, void, (GLenum, GLuint, GLuint), (GLenum, GLuint, GLuint)) \
+    X(glBindBufferRange, void, (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr), (GLenum, GLuint, GLuint, GLintptr, GLsizeiptr)) \
     X(glGenBuffers, void, (GLsizei, GLuint *), (GLsizei, GLuint *)) \
     X(glBindBuffer, void, (GLenum, GLuint), (GLenum, GLuint)) \
     X(glBufferData, void, (GLenum, GLsizeiptr, const void *, GLenum), (GLenum, GLsizeiptr, const void *, GLenum)) \
@@ -148,6 +149,7 @@ GL_FUNCS(GL_DECL)
 #define GL_STREAM_DRAW 0x88E0
 #define GL_DYNAMIC_DRAW 0x88E8
 #define GL_UNIFORM_BUFFER 0x8A11
+#define GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT 0x8A34
 #define GL_FRAGMENT_SHADER 0x8B30
 #define GL_VERTEX_SHADER 0x8B31
 #define GL_COMPILE_STATUS 0x8B81
@@ -491,6 +493,22 @@ static int sCurSamp0, sCurSamp1;
 static int haveScissor = 0;
 static int lastScissor[4];
 static float lastBlendc = -1.0f;
+/* What the GL state is now, so that a pipeline change sends only what differs (the two layers of a fighter's piece
+   alternate pipelines on nearly every draw, and the driver's time per call is most of what OpenGL costs). -1 =
+   unknown: everything is sent again. state_forget() wherever code outside set_pipe touches that state. */
+static int64_t sStBlend = -1, sStMask = -1, sStDepth = -1;
+static GLuint sCurVao;
+/* The vertex programs' uniform blocks: the whole frame's gsVuUni in one buffer, uploaded once at the start of the
+   replay, each draw binding its own range (was a glBufferSubData of 304 bytes into one small buffer per draw,
+   which makes the driver wait for or copy the buffer while earlier draws still read it). */
+static GLint sUniStride;
+static unsigned char *sUniStage;
+static int sCurUni = -1;
+
+static void state_forget(void) {
+    sCurPipe = -1;
+    sStBlend = sStMask = sStDepth = -1;
+}
 
 static void apply_blend(uint32_t bkey) {
     int k[2] = {(int)((bkey >> 1) & 7), (int)((bkey >> 4) & 7)}, C = (int)((bkey >> 7) & 3), i;
@@ -498,6 +516,8 @@ static void apply_blend(uint32_t bkey) {
     GLenum fi = C == 0 ? GL_ONE_MINUS_SRC_ALPHA : C == 1 ? GL_ONE_MINUS_DST_ALPHA : GL_ONE_MINUS_CONSTANT_COLOR;
     GLenum f[2];
     int enabled = (bkey & 1) != 0;
+    if ((int64_t)bkey == sStBlend) { return; }
+    sStBlend = bkey;
     if (sHasIndexed) {
         if (enabled) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glDisablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); }
     } else if (enabled) {
@@ -514,6 +534,8 @@ static void apply_blend(uint32_t bkey) {
 }
 
 static void apply_masks(uint32_t wmask) {
+    if ((int64_t)wmask == sStMask) { return; }
+    sStMask = wmask;
     if (sHasIndexed) {
         glColorMaski(0, (wmask & GS_CC_R) != 0, (wmask & GS_CC_G) != 0, (wmask & GS_CC_B) != 0, (wmask & GS_CC_A) != 0);
         glColorMaski(1, (wmask & GS_CC_A) != 0, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -527,9 +549,10 @@ static void set_params(const void *p, size_t n) {
     glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)n, p);
 }
 
-static void set_uniform_u(const Vu0Uniform *u) {
-    glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(Vu0Uniform), u);
+static void set_uniform_u(int idx) {
+    if (idx == sCurUni) { return; }
+    sCurUni = idx;
+    glBindBufferRange(GL_UNIFORM_BUFFER, 0, sUboU, (GLintptr)idx * sUniStride, (GLsizeiptr)sizeof(Vu0Uniform));
 }
 
 static void set_pipe(int pipe) {
@@ -543,6 +566,11 @@ static void set_pipe(int pipe) {
     }
     apply_blend(p->bkey);
     apply_masks(p->wmask);
+    {
+        int64_t dk = p->fx ? 0 : 1 + (p->zwrite ? 1 : 0) + 2 * (int64_t)p->ztst;
+        if (dk == sStDepth) { return; }
+        sStDepth = dk;
+    }
     if (p->fx) {
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
@@ -554,7 +582,7 @@ static void set_pipe(int pipe) {
 }
 
 static void set_native(int effect) {
-    sCurPipe = -1;
+    state_forget();
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     if (sHasIndexed) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glEnable(GL_BLEND); }
@@ -622,7 +650,7 @@ static void bind_target(int i, int clear) {
         if (sHasIndexed) { glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); }
         else { glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); }
         glDepthMask(GL_TRUE);
-        sCurPipe = -1;
+        state_forget();
         glClearBufferfv(GL_COLOR, 0, col);
         glClearBufferfv(GL_COLOR, 1, aux);
         glClearBufferfv(GL_DEPTH, 0, &dep);
@@ -711,10 +739,18 @@ static int gl_init(void) {
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, MAX_VU_IDX * sizeof(uint32_t), NULL, GL_STREAM_DRAW);
     glBindVertexArray(0);
 
+    {   /* one block per uniform of the frame, each at a multiple of the driver's offset alignment */
+        GLint align = 256;
+        glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
+        if (align < 16) { align = 16; }
+        sUniStride = (GLint)((sizeof(Vu0Uniform) + (size_t)align - 1) / (size_t)align * (size_t)align);
+        free(sUniStage);
+        sUniStage = (unsigned char *)calloc(MAX_VU_UNIFORMS, (size_t)sUniStride);
+    }
     glGenBuffers(1, &sUboU);
     glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
-    glBufferData(GL_UNIFORM_BUFFER, sizeof(Vu0Uniform), NULL, GL_DYNAMIC_DRAW);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, sUboU);
+    glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)MAX_VU_UNIFORMS * sUniStride, NULL, GL_DYNAMIC_DRAW);
+    glBindBufferRange(GL_UNIFORM_BUFFER, 0, sUboU, 0, (GLsizeiptr)sizeof(Vu0Uniform));
     glGenBuffers(1, &sUboParams);
     glBindBuffer(GL_UNIFORM_BUFFER, sUboParams);
     glBufferData(GL_UNIFORM_BUFFER, 80, NULL, GL_DYNAMIC_DRAW);
@@ -810,18 +846,32 @@ static void frame_end(void) {
         }
     }
 
+    /* Each buffer is given new storage before it is written ("orphaning": glBufferData with no data), so the driver
+       need not wait for the previous frame's draws that still read the old contents. */
     if (gsVertCount != 0) {
         glBindBuffer(GL_ARRAY_BUFFER, sVboGs);
+        glBufferData(GL_ARRAY_BUFFER, MAX_VERTS * sizeof(Vtx), NULL, GL_STREAM_DRAW);
         glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVertCount * sizeof(Vtx)), gsVerts);
     }
     if (gsVuVertCount != 0) {
         glBindBuffer(GL_ARRAY_BUFFER, sVboVu);
+        glBufferData(GL_ARRAY_BUFFER, MAX_VU_VERTS * 48, NULL, GL_STREAM_DRAW);
         glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVuVertCount * 48), gsVuVerts);
     }
     if (gsVuIdxCount != 0) {
         glBindVertexArray(sVaoVu);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, MAX_VU_IDX * sizeof(uint32_t), NULL, GL_STREAM_DRAW);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (GLsizeiptr)(gsVuIdxCount * sizeof(uint32_t)), gsVuIdx);
         glBindVertexArray(0);
+    }
+    if (gsVuUniCount != 0 && sUniStage != NULL) {
+        uint32_t k;
+        for (k = 0; k < gsVuUniCount; k++) {
+            memcpy(sUniStage + (size_t)k * (size_t)sUniStride, &gsVuUni[k], sizeof(Vu0Uniform));
+        }
+        glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
+        glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)MAX_VU_UNIFORMS * sUniStride, NULL, GL_DYNAMIC_DRAW);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)gsVuUniCount * sUniStride, sUniStage);
     }
     for (i = 0; i < 2; i++) {
         uint32_t *px, x, y, fbp = i ? 0x70 : 0;
@@ -847,7 +897,9 @@ static void frame_end(void) {
     gGsFbUploads = 0;
 
     glBindVertexArray(sVaoGs);
-    sCurPipe = -1;
+    sCurVao = sVaoGs;
+    state_forget();
+    sCurUni = -1;
     sCurProgram = 0;
     sCurTex0 = sCurTex1 = sCurTex2 = 0;
     sCurSamp0 = sCurSamp1 = -1;
@@ -936,14 +988,14 @@ static void frame_end(void) {
             gsTargets[d->target].cleared = 1;
             cur = d->target;
             haveFu = 0;
-            sCurPipe = -1;
+            state_forget();
             haveScissor = 0;
         } else if (!gsTargets[d->target].cleared) {
             gsTargets[d->target].cleared = 1;
         }
         set_pipe(d->pipeline);
-        glBindVertexArray(d->vu ? sVaoVu : sVaoGs);
-        if (d->vu) { set_uniform_u(&gsVuUni[d->uniform]); }
+        if (sCurVao != (d->vu ? sVaoVu : sVaoGs)) { sCurVao = d->vu ? sVaoVu : sVaoGs; glBindVertexArray(sCurVao); }
+        if (d->vu) { set_uniform_u(d->uniform); }
         memset(&fu, 0, sizeof(fu));
         memcpy(fu.mode, d->mode, sizeof(fu.mode));
         memcpy(fu.misc, d->misc, sizeof(fu.misc));
