@@ -2210,6 +2210,9 @@ the next start; `gs_thread`, or `BT3_GS_THREAD=1` / `0`):
   only on the thread that made it: made from the game's thread they were nothing, and the two buffers that are shown
   stayed empty. Vulkan's device does not mind, which is how the thread was tested before (2026-10-06). Now those
   transfers run on the render thread too (`render_call`), still after the list being drawn.
+- **Seen in the game by the user** (Xeon E3-1240 v2, RX 560 2 GB, Windows, OpenGL, the thread on, split screen):
+  "super fluido", the black picture gone. Not run by anyone yet: an online match, Vulkan with the thread on this
+  build, the story mode's scenes.
 Checked outside the game: 3,000 random chains (CNT, NEXT, REF, REFS, CALL nested past the two-entry stack, RET,
 END, REFE; copy area and block list grown several times) give `vif` the same calls through the copy as through the
 walk; three faults in the copy were caught. Not checked: in the game, by anyone, at the time of writing.
