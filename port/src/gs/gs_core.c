@@ -1497,15 +1497,30 @@ static int gs_on(void) {
 
 /* A transfer on the GIF channel itself (the game uses it for texture uploads outside the frame's list):
    `qwc` quadwords of GIF data at `addr`, or with chain = 1 a source chain of them starting at `addr`. */
-void Port_GsGifChannel(uint32_t addr, uint32_t qwc, int chain) {
-    int guard;
+static void gif_channel(uint32_t addr, uint32_t qwc, int chain);
+typedef struct { uint32_t addr, qwc; int chain; } GifArgs;
+static void gif_job(void *p) { GifArgs *a = p; gif_channel(a->addr, a->qwc, a->chain); }
 
+void Port_GsGifChannel(uint32_t addr, uint32_t qwc, int chain) {
     if (!gs_on()) {
         return;
     }
     if (sThreaded) {
-        render_wait(); /* the GS is one device: this transfer goes after the list that is being drawn */
+        /* On the render thread, after the list that is being drawn (the GS is one device), and the game waits for
+           it. Not on the game's thread: what these packets draw can be the first thing that touches a buffer (the
+           clear that sceGsSwapDBuff sends, at start-up the frame buffers themselves), which creates the buffer's
+           graphics objects, and OpenGL's exist only on the thread that made the context: made from the game's
+           thread they were nothing, and the picture stayed black. (Vulkan does not mind; it was tested with that.) */
+        GifArgs a = {addr, qwc, chain};
+        render_call(gif_job, &a);
+        return;
     }
+    gif_channel(addr, qwc, chain);
+}
+
+static void gif_channel(uint32_t addr, uint32_t qwc, int chain) {
+    int guard;
+
     if (!chain) {
         Gs_Gif((const uint8_t *)(uintptr_t)addr, qwc);
         return;
