@@ -57,7 +57,9 @@ int sceGsExecStoreImage(void *si, void *dst) {
     Gs_StoreImage((unsigned)sStoreBp, (unsigned)sStoreW, (unsigned)sStoreH, (unsigned char *)dst);
     return 0;
 }
-int sceGsSyncPath() { return 0; }
+/* The game's wait for the GS to finish what it was sent: nothing to wait for on one thread (a list is carried out
+   when it is sent); the render thread (gs/gs_core.c) is waited for. */
+int sceGsSyncPath() { extern void Port_GsSyncPath(void); Port_GsSyncPath(); return 0; }
 void *sceGsSyncVCallback(int (*handler)(int)) { void *old = (void *)sVsyncHandler; sVsyncHandler = handler; return old; }
 /* One vertical blank: runs the game's VBlank handler, as the interrupt would. */
 extern void Port_Trace(unsigned vblanks);

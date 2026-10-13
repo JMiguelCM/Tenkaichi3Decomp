@@ -45,6 +45,11 @@ extern int Port_AspectMilli(void);
 extern void Port_SetAspectMilli(int milli), Port_AudioRefresh(void), Port_SettingsWrite(void);
 extern int gPortMenuMode;       /* headless.c: the menus are running */
 extern int Port_PageAspectMilli(void); /* plat_stub.c: the shape of the page shown now (4:3 in the menus if asked for) */
+/* Port_PageAspectMilli for the list being drawn: the same, with the menu mode it was made in (GS_MENU_MODE). */
+int GsDraw_PageAspectMilli(void) {
+    extern int Port_Menus43(void); /* plat_stub.c */
+    return GS_MENU_MODE && Port_Menus43() ? 1333 : Port_AspectMilli();
+}
 extern int gPortMusicPercent, gPortSePercent, gPortVoicePercent, gPortStagePercent;
 
 static GsBackend *sBackend;
@@ -1093,7 +1098,7 @@ void GsGpu_Draw(int type, int ctx, const GsVertex *v) {
     /* (Not the cross-fade's picture: it is the whole frame as it was shown, wide view and all, drawn back over the
        whole frame in strips. Each strip is narrower than the screen, so the rule below took it for a piece of 2D
        art and the old shot was drawn at three quarters of the width over the new one: seen by the user.) */
-    if (Port_IsWide() && (!gPortMenuMode || (gsAnchor == 7 && Port_PageAspectMilli() > 1340)) && !sWholeFrame && !d.tex_is_target && (type == 6 || fst) && gsTargets[d.target].fbp == (uint32_t)gGsMainFbp) {
+    if (Port_IsWide() && (!GS_MENU_MODE || (gsAnchor == 7 && GsDraw_PageAspectMilli() > 1340)) && !sWholeFrame && !d.tex_is_target && (type == 6 || fst) && gsTargets[d.target].fbp == (uint32_t)gGsMainFbp) {
         /* Widescreen. The 3D scene is projected for a 16:9 picture by the game itself; 2D art is laid out for
            4:3 and would come out a third too wide. Each 2D piece is narrowed to 3/4 about a fixed point:
              (not in the menus: their pages are shown whole, stretched to the width; see Port_WideFactor)
@@ -4098,6 +4103,10 @@ void GsGpu_FrameEnd(void) {
             sInterpPrevPrims = malloc(INTERP_MAX_PRIMS * sizeof(InterpPrim));
             sInterpPrims = malloc(INTERP_MAX_PRIMS * sizeof(InterpPrim));
             sInterpPrimUsed = malloc(INTERP_MAX_PRIMS);
+        }
+        if (gGsThreaded) {
+            /* not with the render thread: the in-between pictures are shown from the game's thread (F1 says so) */
+            gsInterp = 0;
         }
         {
             /* A scene the game shows at 60 a second (one vertical blank per picture: menus, the character select) has

@@ -832,7 +832,7 @@ static void frame_end(void) {
         if (PortInput_Hotkey(&ev)) { Ui_Toggle(); continue; }
         if (Ui_Event(&ev)) { continue; }
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { if (!ev.key.repeat && !Ui_QuitAsk()) { exit(0); } /* (asks first) */ }
-        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9) { /* in-between pictures on / off */
+        if (ev.type == SDL_EVENT_KEY_DOWN && !ev.key.repeat && ev.key.key == SDLK_F9 && !gGsThreaded) { /* in-between pictures on / off (not with the render thread) */
             extern int gsInterp;
             extern void Port_SettingSave(const char *name, int value);
             extern void Port_SettingsWrite(void);
@@ -1074,8 +1074,8 @@ static void frame_end(void) {
         glClear(GL_COLOR_BUFFER_BIT);
         glEnable(GL_SCISSOR_TEST);
         if (best >= 0 && gsTargets[best].cleared) {
-            extern int Port_PageAspectMilli(void); /* plat_stub.c: 4:3 while the menus run, if asked for */
-            float want = (float)Port_PageAspectMilli() / 1000.0f;
+            extern int GsDraw_PageAspectMilli(void); /* gs_draw.c: 4:3 while the menus run, if asked for */
+            float want = (float)GsDraw_PageAspectMilli() / 1000.0f;
             int w = sw, h = sh, dx, dy;
             if ((float)sw > (float)sh * want) { w = (int)((float)sh * want + 0.5f); } else { h = (int)((float)sw / want + 0.5f); }
             dx = (sw - w) / 2;
