@@ -2204,6 +2204,12 @@ the next start; `gs_thread`, or `BT3_GS_THREAD=1` / `0`):
   black before. Keeping and restoring the GS state wait; an online session draws each list before the game goes on.
 - The menu mode the renderer reads is the one the list was made in (`GS_MENU_MODE`, `gGsListMenuMode`).
 - Smooth motion is off while it is on (its pictures are shown from the game's thread); F1 says so, F9 does nothing.
+- **Black picture with OpenGL** (the user's first try of the thread): the game's own GIF-channel transfers (the clear
+  sceGsSwapDBuff sends every frame, at start-up the frame buffers' first draws) still ran on the game's thread after
+  waiting. A first draw into a buffer creates its graphics objects (`target_ensure`), and an OpenGL context exists
+  only on the thread that made it: made from the game's thread they were nothing, and the two buffers that are shown
+  stayed empty. Vulkan's device does not mind, which is how the thread was tested before (2026-10-06). Now those
+  transfers run on the render thread too (`render_call`), still after the list being drawn.
 Checked outside the game: 3,000 random chains (CNT, NEXT, REF, REFS, CALL nested past the two-entry stack, RET,
 END, REFE; copy area and block list grown several times) give `vif` the same calls through the copy as through the
 walk; three faults in the copy were caught. Not checked: in the game, by anyone, at the time of writing.
