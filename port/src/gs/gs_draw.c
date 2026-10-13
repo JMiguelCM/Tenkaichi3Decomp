@@ -851,6 +851,76 @@ int GsDraw_DateRegion(uint32_t k, int *rx, int *ry, int *rw, int *rh) {
     return 1;
 }
 
+/* Does draw `d` read the copy of the ids (sAuxCopy in both back ends)? The outline (native 1), the see-through
+   tint (2) and a table pass indexed by the alpha copy (3 with src 1). */
+static int aux_reader(const GsDraw *d) {
+    return d->native == 1 || d->native == 2 || (d->native == 3 && d->src == 1);
+}
+
+/* The part of the copy of the ids that the passes after snapshot `k` (a native 4, GfxPost_CopyAlphaToDepth) read:
+   the union of their scissors up to the next snapshot, widened by two GS pixels (the outline reads its four
+   neighbours, one GS pixel away). A back end copies only that. It was the whole target every time: 1024 x 1024
+   GS pixels times the multiplier, where the game's picture is 512 x 448 of it, and in split screen the copy is
+   made once per half, each half reading only its own. Returns 0 when nothing reads this copy.
+   The copy is read only after a snapshot in the same frame (looked at below); if a pass ever reads it before the
+   frame's first snapshot, the copy's parts outside the last regions would be older than with whole copies, so from
+   then on the whole target is copied again. BT3_AUX_WHOLE=1 copies the whole target as before (to compare). */
+int GsDraw_AuxRegion(uint32_t k, int *rx, int *ry, int *rw, int *rh) {
+    static int all = -1;
+    int W = GS_W * SCALE, H = GS_H * SCALE, x0 = W, y0 = H, x1 = 0, y1 = 0, any = 0, m = 2 * SCALE;
+    uint32_t i;
+
+    if (all < 0) {
+        all = getenv("BT3_AUX_WHOLE") != NULL;
+    }
+    if (!all) {
+        uint32_t j;
+        for (j = 0; j < k; j++) {
+            if (gsDraws[j].native == 4) {
+                break; /* not the frame's first snapshot: checked when that one was copied */
+            }
+            if (aux_reader(&gsDraws[j])) {
+                all = 1;
+                fprintf(stderr, "gs: the ids' copy is read before the frame's first copy: whole copies from now on\n");
+                break;
+            }
+        }
+    }
+    for (i = k + 1; i < gsDrawCount; i++) {
+        const GsDraw *d = &gsDraws[i];
+        int a0, b0, a1, b1;
+        if (d->native == 4) {
+            break;
+        }
+        if (!aux_reader(d)) {
+            continue;
+        }
+        any = 1;
+        a0 = d->scissor[0] - m, b0 = d->scissor[1] - m;
+        a1 = d->scissor[0] + d->scissor[2] + m, b1 = d->scissor[1] + d->scissor[3] + m;
+        if (a0 < x0) { x0 = a0; }
+        if (b0 < y0) { y0 = b0; }
+        if (a1 > x1) { x1 = a1; }
+        if (b1 > y1) { y1 = b1; }
+    }
+    if (all) {
+        *rx = 0, *ry = 0, *rw = W, *rh = H;
+        return 1;
+    }
+    if (!any) {
+        return 0;
+    }
+    if (x0 < 0) { x0 = 0; }
+    if (y0 < 0) { y0 = 0; }
+    if (x1 > W) { x1 = W; }
+    if (y1 > H) { y1 = H; }
+    if (x1 <= x0 || y1 <= y0) {
+        return 0; /* every reader is off the buffer */
+    }
+    *rx = x0, *ry = y0, *rw = x1 - x0, *rh = y1 - y0;
+    return 1;
+}
+
 /* Gs_StateBack (gs_core.c) moved every page's upload generation on by `delta`, so that nothing decoded from the
    pages in between is taken for them. The buffers the game draws into keep their standing: one that was drawn
    since the last upload over it still is. */

@@ -880,6 +880,8 @@ static void frame_end(void) {
             if (!gsTargets[d->target].cleared) { continue; }
             /* the DATE copy: only what the draws that follow read (gs_draw.c); rows as in the Vulkan back end */
             if (d->native == 5 && !GsDraw_DateRegion(n, &rx, &ry, &rw, &rh)) { continue; }
+            /* the ids' copy: the same, the scissors of the passes that read it (one half each in split screen) */
+            if (d->native == 4 && !GsDraw_AuxRegion(n, &rx, &ry, &rw, &rh)) { continue; }
             /* The copy of the frame's alpha ids (the outline and the DATE passes read it). glBlitFramebuffer is
                clipped by the scissor test, so with a partial scissor in force (the split screen's halves) only
                part of the alpha would be copied and the outline would draw a stale silhouette; turn it off for
