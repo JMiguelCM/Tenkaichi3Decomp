@@ -355,7 +355,7 @@ static GLuint sOutlineProg, sKeyProg, sDclutProg, sPresentProg;
 static GLuint sVaoGs, sVaoVu, sVboGs, sVboVu, sIboVu;
 static GLuint sSamplers[16];
 static GLuint sWhite;
-static GLuint sUboU, sUboParams;
+static GLuint sUboU;
 static GLuint sTgCol[MAX_TARGETS], sTgAux[MAX_TARGETS], sTgDep[MAX_TARGETS], sTgFbo[MAX_TARGETS];
 static GLuint sDateCopy, sAuxCopy;
 static GLuint sScratchRead, sScratchDraw;
@@ -504,6 +504,22 @@ static GLuint sCurVao;
 static GLint sUniStride;
 static unsigned char *sUniStage;
 static int sCurUni = -1;
+/* The Params block (binding 1) of every draw: worked out for the whole frame before the replay (consecutive equal
+   ones shared), uploaded once, each draw binding its range. It was a glBufferSubData into one 80-byte buffer
+   whenever a draw's block differed from the one before, which is most draws. */
+#define FU_BYTES 80 /* gs.frag's block: mode, misc, rect, orig, extra; the effect passes read the first 16 bytes */
+static GLuint sUboFu;
+static GLint sFuStride;
+static unsigned char *sFuStage;
+static uint32_t *sFuIndex;
+static GLsizeiptr sFuCap;
+static int64_t sCurFu = -1;
+
+static void bind_fu(uint32_t idx) {
+    if ((int64_t)idx == sCurFu) { return; }
+    sCurFu = idx;
+    glBindBufferRange(GL_UNIFORM_BUFFER, 1, sUboFu, (GLintptr)idx * sFuStride, (GLsizeiptr)FU_BYTES);
+}
 
 static void state_forget(void) {
     sCurPipe = -1;
@@ -542,11 +558,6 @@ static void apply_masks(uint32_t wmask) {
     } else {
         glColorMask((wmask & GS_CC_R) != 0, (wmask & GS_CC_G) != 0, (wmask & GS_CC_B) != 0, (wmask & GS_CC_A) != 0);
     }
-}
-
-static void set_params(const void *p, size_t n) {
-    glBindBuffer(GL_UNIFORM_BUFFER, sUboParams);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)n, p);
 }
 
 static void set_uniform_u(int idx) {
@@ -744,17 +755,23 @@ static int gl_init(void) {
         glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align);
         if (align < 16) { align = 16; }
         sUniStride = (GLint)((sizeof(Vu0Uniform) + (size_t)align - 1) / (size_t)align * (size_t)align);
+        sFuStride = (GLint)((FU_BYTES + (size_t)align - 1) / (size_t)align * (size_t)align);
         free(sUniStage);
         sUniStage = (unsigned char *)calloc(MAX_VU_UNIFORMS, (size_t)sUniStride);
+        free(sFuStage);
+        sFuStage = (unsigned char *)calloc(MAX_DRAWS, (size_t)sFuStride);
+        free(sFuIndex);
+        sFuIndex = (uint32_t *)calloc(MAX_DRAWS, sizeof(uint32_t));
     }
     glGenBuffers(1, &sUboU);
     glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
     glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)MAX_VU_UNIFORMS * sUniStride, NULL, GL_DYNAMIC_DRAW);
     glBindBufferRange(GL_UNIFORM_BUFFER, 0, sUboU, 0, (GLsizeiptr)sizeof(Vu0Uniform));
-    glGenBuffers(1, &sUboParams);
-    glBindBuffer(GL_UNIFORM_BUFFER, sUboParams);
-    glBufferData(GL_UNIFORM_BUFFER, 80, NULL, GL_DYNAMIC_DRAW);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 1, sUboParams);
+    glGenBuffers(1, &sUboFu);
+    glBindBuffer(GL_UNIFORM_BUFFER, sUboFu);
+    sFuCap = (GLsizeiptr)4096 * sFuStride; /* grows when a frame needs more */
+    glBufferData(GL_UNIFORM_BUFFER, sFuCap, NULL, GL_DYNAMIC_DRAW);
+    glBindBufferRange(GL_UNIFORM_BUFFER, 1, sUboFu, 0, (GLsizeiptr)FU_BYTES);
 
     for (i = 0; i < 16; i++) {
         int lin = (i & 1) != 0;
@@ -807,8 +824,7 @@ static void frame_end(void) {
     SDL_Event ev;
     int cur = -1, best = -1, i;
     uint32_t n;
-    struct { int32_t mode[4]; float misc[4]; float rect[4]; float orig[4]; float extra[4]; } fu, lastFu;
-    int haveFu = 0;
+    struct { int32_t mode[4]; float misc[4]; float rect[4]; float orig[4]; float extra[4]; } fu;
 
     GsGpu_TitlePoll();
     while (SDL_PollEvent(&ev)) {
@@ -872,6 +888,51 @@ static void frame_end(void) {
         glBindBuffer(GL_UNIFORM_BUFFER, sUboU);
         glBufferData(GL_UNIFORM_BUFFER, (GLsizeiptr)MAX_VU_UNIFORMS * sUniStride, NULL, GL_DYNAMIC_DRAW);
         glBufferSubData(GL_UNIFORM_BUFFER, 0, (GLsizeiptr)gsVuUniCount * sUniStride, sUniStage);
+    }
+    {   /* every draw's Params block (the replay below binds them), as the replay used to send them one by one */
+        uint32_t nb = 0;
+        float fxParams[4];
+        fxParams[0] = 1.0f / (float)GS_W;
+        fxParams[1] = 1.0f / (float)GS_H;
+        fxParams[2] = 100.0f / 255.0f;
+        fxParams[3] = getenv("BT3_FX_DEBUG") != NULL ? 1.0f : 0.0f;
+        for (n = 0; n < gsDrawCount && sFuStage != NULL; n++) {
+            const GsDraw *d = &gsDraws[n];
+            unsigned char *b = sFuStage + (size_t)nb * (size_t)sFuStride;
+            if (d->native == 4 || d->native == 5 || d->native >= 100) {
+                sFuIndex[n] = 0; /* a copy: no Params */
+                continue;
+            }
+            memset(&fu, 0, sizeof(fu));
+            if (d->native == 3) {
+                float params[4] = {(float)d->src, d->misc[0], 0.0f, 0.0f};
+                memcpy(&fu, params, sizeof(params));
+            } else if (d->native) {
+                memcpy(&fu, fxParams, sizeof(fxParams));
+            } else {
+                memcpy(fu.mode, d->mode, sizeof(fu.mode));
+                memcpy(fu.misc, d->misc, sizeof(fu.misc));
+                memcpy(fu.rect, d->rect, sizeof(fu.rect));
+                memcpy(fu.orig, d->orig, sizeof(fu.orig));
+                fu.extra[0] = d->vu ? (gsVuUni[d->uniform].misc[2] > 0.0f ? gsVuUni[d->uniform].misc[2] : 0.0f) : gsZMax;
+            }
+            if (nb > 0 && memcmp(b - sFuStride, &fu, FU_BYTES) == 0) {
+                sFuIndex[n] = nb - 1; /* the same as the draw before: shared */
+                continue;
+            }
+            memcpy(b, &fu, FU_BYTES);
+            sFuIndex[n] = nb++;
+        }
+        if (nb != 0) {
+            GLsizeiptr need = (GLsizeiptr)nb * sFuStride;
+            glBindBuffer(GL_UNIFORM_BUFFER, sUboFu);
+            if (need > sFuCap) {
+                while (sFuCap < need) { sFuCap *= 2; }
+            }
+            glBufferData(GL_UNIFORM_BUFFER, sFuCap, NULL, GL_DYNAMIC_DRAW); /* new storage (see the vertex buffers) */
+            glBufferSubData(GL_UNIFORM_BUFFER, 0, need, sFuStage);
+        }
+        sCurFu = -1;
     }
     for (i = 0; i < 2; i++) {
         uint32_t *px, x, y, fbp = i ? 0x70 : 0;
@@ -954,30 +1015,22 @@ static void frame_end(void) {
             continue;
         }
         if (d->native == 3) {
-            float params[4] = {(float)d->src, d->misc[0], 0.0f, 0.0f};
             if (!gsTargets[d->target].cleared) { continue; }
             if (cur != d->target) { bind_target(d->target, 0); cur = d->target; }
             set_pipe(d->pipeline);
             set_textures(sTgDep[d->target], 6, sAuxCopy, 6, (GLuint)d->tex, 6);
-            set_params(params, 16);
-            haveFu = 0; /* the Params block now holds this pass's: the next primitive sends its own again */
+            bind_fu(sFuIndex[n]); /* {src, depth maximum} (worked out before the replay) */
             if (d->blendc != lastBlendc) { glBlendColor(d->blendc, d->blendc, d->blendc, d->blendc); lastBlendc = d->blendc; }
             set_scissor(d->scissor);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             continue;
         }
         if (d->native) {
-            float params[4];
             if (!gsTargets[d->target].cleared) { continue; }
             if (cur != d->target) { bind_target(d->target, 0); cur = d->target; }
             set_native(d->native);
             set_textures(sAuxCopy, 6, 0, 6, 0, 6);
-            params[0] = 1.0f / (float)GS_W;
-            params[1] = 1.0f / (float)GS_H;
-            params[2] = 100.0f / 255.0f;
-            params[3] = getenv("BT3_FX_DEBUG") != NULL ? 1.0f : 0.0f;
-            set_params(params, 16);
-            haveFu = 0;
+            bind_fu(sFuIndex[n]); /* one PS2 pixel in uv, the darkness, the debug view */
             set_scissor(d->scissor);
             glDrawArrays(GL_TRIANGLES, 0, 3);
             continue;
@@ -987,7 +1040,6 @@ static void frame_end(void) {
             bind_target(d->target, !gsTargets[d->target].cleared);
             gsTargets[d->target].cleared = 1;
             cur = d->target;
-            haveFu = 0;
             state_forget();
             haveScissor = 0;
         } else if (!gsTargets[d->target].cleared) {
@@ -996,17 +1048,7 @@ static void frame_end(void) {
         set_pipe(d->pipeline);
         if (sCurVao != (d->vu ? sVaoVu : sVaoGs)) { sCurVao = d->vu ? sVaoVu : sVaoGs; glBindVertexArray(sCurVao); }
         if (d->vu) { set_uniform_u(d->uniform); }
-        memset(&fu, 0, sizeof(fu));
-        memcpy(fu.mode, d->mode, sizeof(fu.mode));
-        memcpy(fu.misc, d->misc, sizeof(fu.misc));
-        memcpy(fu.rect, d->rect, sizeof(fu.rect));
-        memcpy(fu.orig, d->orig, sizeof(fu.orig));
-        fu.extra[0] = d->vu ? (gsVuUni[d->uniform].misc[2] > 0.0f ? gsVuUni[d->uniform].misc[2] : 0.0f) : gsZMax;
-        if (!haveFu || memcmp(&fu, &lastFu, sizeof(fu)) != 0) {
-            set_params(&fu, sizeof(fu));
-            memcpy(&lastFu, &fu, sizeof(fu));
-            haveFu = 1;
-        }
+        bind_fu(sFuIndex[n]);
         set_textures((GLuint)d->tex, d->sampler, sDateCopy, 6, 0, 6);
         if (d->blendc != lastBlendc) { glBlendColor(d->blendc, d->blendc, d->blendc, d->blendc); lastBlendc = d->blendc; }
         set_scissor(d->scissor);
