@@ -6,7 +6,8 @@
  * The settings overlay (port/src/gs/gs_gpu.c) writes it whenever a setting changes. At start an environment
  * variable (BT3_SCALE, BT3_ASPECT, ...) still wins over the file, so a single run can be started differently.
  * Names: scale, aspect_milli, fullscreen, fx_off, glow, music, effects, voices, stage_sounds, hud_layout, game_speed, music_follows_speed, display; the bindings of port/src/gs/gs_input.c
- * (key_p1_cross = an SDL scancode, pad_p1_cross = a controller button, padslot_p1 = which controller).
+ * (key_p1_cross = an SDL scancode, pad_p1_cross = a controller button, padslot_p1 = which controller,
+ * deadzone_p1_ls / deadzone_p1_rs = a stick's deadzone, vibration_p1 and vibration_p1_strength).
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -15,7 +16,7 @@
 
 #define MAX_SETTINGS 200
 static struct { char name[24]; int value; } sSet[MAX_SETTINGS];
-/* The few settings that are text (the player's online name): `name="text"` in the file, after the numbers. A
+/* The few settings that are text (online name, menu language): `name="text"` in the file, after the numbers. A
    release from before these reads past such a line. */
 #define MAX_TEXTS 8
 static struct { char name[24]; char value[64]; } sText[MAX_TEXTS];

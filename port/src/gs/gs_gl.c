@@ -7,7 +7,7 @@
  *
  * Written from the ground up against the canonical OpenGL 3.3 core patterns (learnopengl.com):
  *   - one VAO per vertex layout, configured once with the VBO bound;
- *   - a framebuffer per target: colour (GL_RGBA8) + aux (GL_R8) + depth (GL_DEPTH_COMPONENT32F), complete, and
+ *   - a framebuffer per target: colour (GL_RGBA8) + aux (GL_R8) + depth/stencil (GL_DEPTH32F_STENCIL8), complete, and
  *     used through GL_FRAMEBUFFER;
  *   - depth/colour state set explicitly before every draw, exactly like a pipeline object would be.
  * The GL floor is 3.3 core.
@@ -50,6 +50,10 @@ typedef void GLvoid; typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; t
     X(glColorMaski, void, (GLuint, GLboolean, GLboolean, GLboolean, GLboolean), (GLuint, GLboolean, GLboolean, GLboolean, GLboolean)) \
     X(glColorMask, void, (GLboolean, GLboolean, GLboolean, GLboolean), (GLboolean, GLboolean, GLboolean, GLboolean)) \
     X(glDepthFunc, void, (GLenum), (GLenum)) \
+    X(glStencilFunc, void, (GLenum, GLint, GLuint), (GLenum, GLint, GLuint)) \
+    X(glStencilOp, void, (GLenum, GLenum, GLenum), (GLenum, GLenum, GLenum)) \
+    X(glStencilMask, void, (GLuint), (GLuint)) \
+    X(glClearStencil, void, (GLint), (GLint)) \
     X(glDepthMask, void, (GLboolean), (GLboolean)) \
     X(glCreateShader, GLuint, (GLenum), (GLenum)) \
     X(glShaderSource, void, (GLuint, GLsizei, const GLchar *const *, const GLint *), (GLuint, GLsizei, const GLchar *const *, const GLint *)) \
@@ -111,6 +115,7 @@ GL_FUNCS(GL_DECL)
 #define GL_NO_ERROR 0
 #define GL_COLOR_BUFFER_BIT 0x00004000
 #define GL_DEPTH_BUFFER_BIT 0x00000100
+#define GL_STENCIL_BUFFER_BIT 0x00000400
 #define GL_POINTS 0x0000
 #define GL_LINES 0x0001
 #define GL_TRIANGLES 0x0004
@@ -120,10 +125,12 @@ GL_FUNCS(GL_DECL)
 #define GL_COLOR 0x1800
 #define GL_DEPTH 0x1801
 #define GL_DEPTH_COMPONENT 0x1902
+#define GL_DEPTH_STENCIL 0x84F9
 #define GL_RGBA 0x1908
 #define GL_RGBA8 0x8058
 #define GL_R8 0x8229
-#define GL_DEPTH_COMPONENT32F 0x8CAC
+#define GL_DEPTH32F_STENCIL8 0x8CAD
+#define GL_FLOAT_32_UNSIGNED_INT_24_8_REV 0x8DAD
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_TEXTURE0 0x84C0
 #define GL_TEXTURE_MIN_FILTER 0x2801
@@ -161,6 +168,7 @@ GL_FUNCS(GL_DECL)
 #define GL_PACK_ALIGNMENT 0x0D05
 #define GL_BLEND 0x0BE2
 #define GL_DEPTH_TEST 0x0B71
+#define GL_STENCIL_TEST 0x0B90
 #define GL_SCISSOR_TEST 0x0C11
 #define GL_CULL_FACE 0x0B44
 #define GL_DEPTH_CLAMP 0x864F
@@ -179,7 +187,10 @@ GL_FUNCS(GL_DECL)
 #define GL_FUNC_REVERSE_SUBTRACT 0x800B
 #define GL_NEVER 0x0200
 #define GL_GREATER 0x0204
+#define GL_EQUAL 0x0202
 #define GL_GEQUAL 0x0206
+#define GL_KEEP 0x1E00
+#define GL_INCR 0x1E02
 #define GL_ALWAYS 0x0207
 #define GL_FRAMEBUFFER 0x8D40
 #define GL_BACK 0x0405
@@ -188,7 +199,7 @@ GL_FUNCS(GL_DECL)
 #define GL_DRAW_FRAMEBUFFER 0x8CA9
 #define GL_COLOR_ATTACHMENT0 0x8CE0
 #define GL_COLOR_ATTACHMENT1 0x8CE1
-#define GL_DEPTH_ATTACHMENT 0x8D00
+#define GL_DEPTH_STENCIL_ATTACHMENT 0x821A
 #define GL_FRAMEBUFFER_COMPLETE 0x8CD5
 #define GL_INVALID_INDEX 0xFFFFFFFFu
 
@@ -365,7 +376,7 @@ static const char *sGsSamplers[2] = {"tex", "dateTex"};
 static const char *sOneSampler[1] = {"aux"};
 static const char *sDclutSamplers[3] = {"depthTex", "auxTex", "clutTex"};
 
-typedef struct Pipe { uint32_t key, bkey, wmask; int ztst, zwrite, topo, vu, fx, nz; } Pipe;
+typedef struct Pipe { uint32_t key, bkey, wmask; int ztst, zwrite, topo, vu, fx, nz, shadow; } Pipe;
 static Pipe sPipes[1024];
 static int sPipeCount;
 
@@ -385,14 +396,15 @@ static void target_ensure(int i) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, GS_W * SCALE, GS_H * SCALE, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
     glGenTextures(1, &sTgDep[i]);
     glBindTexture(GL_TEXTURE_2D, sTgDep[i]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, GS_W * SCALE, GS_H * SCALE, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH32F_STENCIL8, GS_W * SCALE, GS_H * SCALE, 0,
+                 GL_DEPTH_STENCIL, GL_FLOAT_32_UNSIGNED_INT_24_8_REV, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glGenFramebuffers(1, &sTgFbo[i]);
     glBindFramebuffer(GL_FRAMEBUFFER, sTgFbo[i]);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sTgCol[i], 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, sTgAux[i], 0);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, sTgDep[i], 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, sTgDep[i], 0);
     glDrawBuffers(2, bufs);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         fprintf(stderr, "bt3: gl: target %d framebuffer incomplete\n", i);
@@ -466,12 +478,13 @@ static void scale_changed(void) {
 /* ---- pipelines ---------------------------------------------------------------------------------- */
 static void pipe_decode(Pipe *p, uint32_t key) {
     p->key = key;
-    p->bkey = key & 0x1FF;
+    p->bkey = key & 0x3FF;
     p->ztst = (int)((key >> 10) & 3);
     p->zwrite = (int)((key >> 12) & 1);
     p->topo = (int)((key >> 13) & 3);
     p->vu = (int)((key >> 20) & 3);
     p->nz = (int)((key >> 23) & 1);
+    p->shadow = (int)((key >> 24) & 1);
     p->fx = (int)((key >> 22) & 1);
     p->wmask = (key >> 16) & 15;
 }
@@ -545,6 +558,9 @@ static void apply_blend(uint32_t bkey) {
     for (i = 0; i < 2; i++) {
         f[i] = k[i] == 0 ? GL_ZERO : k[i] == 1 || k[i] == 5 ? GL_ONE : k[i] == 4 ? fi : fc;
     }
+    if (bkey & (1u << 9)) {
+        f[0] = GL_ONE; /* (the shader scaled the source by its alpha: gs_draw.c, blend_key) */
+    }
     glBlendFuncSeparate(f[0], f[1], GL_ONE, GL_ZERO);
     glBlendEquationSeparate(k[0] == 3 ? GL_FUNC_REVERSE_SUBTRACT : k[1] == 3 ? GL_FUNC_SUBTRACT : GL_FUNC_ADD, GL_FUNC_ADD);
 }
@@ -584,17 +600,27 @@ static void set_pipe(int pipe) {
     }
     if (p->fx) {
         glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
         glDepthMask(GL_FALSE);
     } else {
         glEnable(GL_DEPTH_TEST);
         glDepthMask(p->zwrite ? GL_TRUE : GL_FALSE);
         glDepthFunc(p->ztst == 0 ? GL_NEVER : p->ztst == 1 ? GL_ALWAYS : p->ztst == 2 ? GL_GEQUAL : GL_GREATER);
+        if (p->shadow) {
+            glEnable(GL_STENCIL_TEST);
+            glStencilFunc(GL_EQUAL, 0, 0xff);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_INCR);
+            glStencilMask(0xff);
+        } else {
+            glDisable(GL_STENCIL_TEST);
+        }
     }
 }
 
 static void set_native(int effect) {
     state_forget();
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
     glDepthMask(GL_FALSE);
     if (sHasIndexed) { glEnablei(GL_BLEND, 0); glDisablei(GL_BLEND, 1); } else { glEnable(GL_BLEND); }
     if (effect == 2) {
@@ -795,7 +821,7 @@ static int gl_init(void) {
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glViewport(0, 0, GS_W * SCALE, GS_H * SCALE);
     /* the overlay (F1's settings, the online window) here too: ImGui's OpenGL3 backend, with the context current */
-    if (!Ui_Init(sWindow, NULL, (void *)sCtx)) {
+    if (!Ui_Init(sWindow, NULL, (void *)sCtx, (const char *)glGetString(GL_RENDERER))) {
         fprintf(stderr, "bt3: gl: the settings window is not available\n");
     }
     return 1;
@@ -829,6 +855,7 @@ static void frame_end(void) {
     GsGpu_TitlePoll();
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_EVENT_QUIT) { exit(0); }
+        { extern void PortA11y_Event(const SDL_Event *ev); PortA11y_Event(&ev); } /* a11y.c: the repeat key and button */
         if (PortInput_Hotkey(&ev)) { Ui_Toggle(); continue; }
         if (Ui_Event(&ev)) { continue; }
         if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.key == SDLK_ESCAPE) { if (!ev.key.repeat && !Ui_QuitAsk()) { exit(0); } /* (asks first) */ }
@@ -915,6 +942,7 @@ static void frame_end(void) {
                 memcpy(fu.rect, d->rect, sizeof(fu.rect));
                 memcpy(fu.orig, d->orig, sizeof(fu.orig));
                 fu.extra[0] = d->vu ? (gsVuUni[d->uniform].misc[2] > 0.0f ? gsVuUni[d->uniform].misc[2] : 0.0f) : gsZMax;
+                fu.extra[1] = (sPipes[d->pipeline].key & (1u << 9)) ? 1.0f : 0.0f; /* the source scaled by its alpha */
             }
             if (nb > 0 && memcmp(b - sFuStride, &fu, FU_BYTES) == 0) {
                 sFuIndex[n] = nb - 1; /* the same as the draw before: shared */
@@ -972,6 +1000,7 @@ static void frame_end(void) {
     glEnable(GL_SCISSOR_TEST);
     for (n = 0; n < gsDrawCount; n++) {
         const GsDraw *d = &gsDraws[n];
+        int shadowStart;
         if (d->native >= 100) {
             GLenum one[1] = {GL_COLOR_ATTACHMENT0};
             if (sFbTex[d->native - 100] == 0) { continue; }
@@ -1036,6 +1065,9 @@ static void frame_end(void) {
             continue;
         }
         /* an ordinary primitive */
+        shadowStart = sPipes[d->pipeline].shadow &&
+            (n == 0 || gsDraws[n - 1].native || gsDraws[n - 1].target != d->target ||
+             !sPipes[gsDraws[n - 1].pipeline].shadow);
         if (cur != d->target) {
             bind_target(d->target, !gsTargets[d->target].cleared);
             gsTargets[d->target].cleared = 1;
@@ -1044,6 +1076,15 @@ static void frame_end(void) {
             haveScissor = 0;
         } else if (!gsTargets[d->target].cleared) {
             gsTargets[d->target].cleared = 1;
+        }
+        if (shadowStart) {
+            /* One bit per pixel blocks every later triangle of this flat-shadow run. */
+            glDisable(GL_SCISSOR_TEST);
+            glStencilMask(0xff);
+            glClearStencil(0);
+            glClear(GL_STENCIL_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+            haveScissor = 0;
         }
         set_pipe(d->pipeline);
         if (sCurVao != (d->vu ? sVaoVu : sVaoGs)) { sCurVao = d->vu ? sVaoVu : sVaoGs; glBindVertexArray(sCurVao); }
@@ -1064,6 +1105,7 @@ static void frame_end(void) {
     for (i = 0; best < 0 && i < gsTargetCount; i++) { best = i; }
     glBindVertexArray(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_STENCIL_TEST);
     {
         int sw, sh;
         SDL_GetWindowSize(sWindow, &sw, &sh);

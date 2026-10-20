@@ -46,15 +46,26 @@ void Port_NetLeave(void);
 
 enum { PAD = 18, RING = 4096, REDUNDANT = 16, MAGIC = 0x4E335442 /* "BT3N" */ };
 enum { T_HELLO = 1, T_HELLO_ACK = 2, T_INPUT = 3, T_BYE = 4, T_PING = 5, T_PONG = 6, T_CONFIG = 7, T_CONFIG_ACK = 8,
-       T_PUNCH = 9 /* nothing to read: sent so that the sender's router lets the other side's packets in (room codes) */ };
+       T_PUNCH = 9 /* nothing to read: sent so that the sender's router lets the other side's packets in (room codes) */,
+       T_CHAT = 10 /* a line of text between the players (net_chat.c): its number, its length, its bytes. Not part of
+                      the game: a copy without the chat ignores it, so NET_VERSION stays */,
+       T_FPRINT = 12 /* the sender's gameplay fingerprint (fprint_send, below); a copy without it ignores it */ };
 /* The version of what goes over the line. The greeting and its answer carry it, and two copies that differ do not
    start a match (the input packets changed with version 2: times for the ping were added; a copy that read them
    the old way took them for input). 1 was releases 0.1.8 and 0.1.9, which said no version. */
-enum { NET_VERSION = 3, IN_HEAD = 32 }; /* 3 (0.1.15): the host's battle rules travel with its choices */
+enum { NET_VERSION = 5, IN_HEAD = 44 }; /* 3 (0.1.15): the host's battle rules travel with its choices.
+   4 (0.1.34): a session's start-up no longer follows the player's "Skip logos" / "Skip intro video" (0.1.32 and
+   0.1.33 with either on computed another start-up than the other side and the two never agreed again: such a copy
+   must not be let into a match); the input packets carry the sender's check value (sync_*, below), 12 bytes more
+   in their head; the goodbye can say why.
+   5: a session's start-up is run with nothing pressed and without waiting for the other side, which then is not
+   sent the start-up's input; the two meet at the character select (T_ARRIVED). A copy of 4 would wait for input
+   that does not come. */
 static int sVersionBad; /* the other side answered with another version */
 static const uint32_t kVersion = NET_VERSION;
 #include "net_match.h"
 #include "net_relay.h"
+#include "net_chat.h"
 static int sLobbyOther;
 
 /* What the meter shows (ui.cpp): the round trip time, and per second how often the game went back, how far, and
@@ -62,7 +73,7 @@ static int sLobbyOther;
 static uint32_t sEchoTs, sEchoAtMs;     /* the other side's last send time and when it arrived here */
 static int sPingMs = -1;
 static unsigned sSecRoll, sSecRollTicks, sSecWaits, sSecWaitMs, sSecTicks;
-static int sShown[5] = {0, 0, 0, 0, 0}; /* ping, rollbacks, depth x 10, waits, ms waited: of the last second */
+static int sShown[6] = {0, 0, 0, 0, 0, 0}; /* ping, rollbacks, depth x 10, waits, ms waited, why (wait_why): of the last second */
 
 static uint32_t now_ms(void) {
     return (uint32_t)(SDL_GetTicksNS() / 1000000ull) | 1u; /* (never 0: 0 means "no time yet") */
@@ -74,13 +85,19 @@ static uint32_t now_ms(void) {
    playing work against each other; the host's is only the other side's starting value.) */
 static int sOptRoll = -1, sOptDelay = -1;
 static int sCfgGot, sCfgDelay, sCfgRoll;
-static int sGone; /* the other player said goodbye */
+static int sGone; /* the other player said goodbye (2: because its check found the two games apart) */
 extern void Port_UiNotice(const char *text); /* ui.cpp: a line over the picture for a few seconds */
+extern void Port_UiBanner(const char *text, int ms); /* ui.cpp: a line in the middle while the game waits */
+extern void Gs_HoldFrame(void);                      /* gs_draw.c: the last picture again, with that line on it */
+extern const char *MenuTranslation_PortText(const char *id);
+static void session_hold(void);
 
 static int sAutoDelay;
 static int sOptAuto;      /* the host asked for the input delay to be chosen from the line's ping */
 static int sSetupRtt = -1; /* the smallest round trip measured while setting up, ms */
 static int sCfgAcked;
+
+void Port_TestSlow(int what, int amount);
 
 void Port_NetOptions(int rollback, int delay) {
     sOptRoll = rollback;
@@ -92,7 +109,11 @@ void Port_NetOptions(int rollback, int delay) {
 static char sNames[2][NAME_LEN], sMyName[NAME_LEN] = "Player";
 
 void Port_NetNameSet(const char *name) {
-    snprintf(sMyName, sizeof(sMyName), "%s", name != NULL && name[0] != '\0' ? name : "Player");
+    /* (through a copy: the menus pass the buffer of Port_NetNameGet(), this one, and snprintf into its own source is
+       undefined: glibc left it empty, the name gone from a quick match on Linux until the next start) */
+    char copy[NAME_LEN];
+    snprintf(copy, sizeof(copy), "%s", name != NULL && name[0] != '\0' ? name : "Player");
+    memcpy(sMyName, copy, sizeof(sMyName));
 }
 
 /* A match found with a room code (the lobby, below): the local port the lobby's socket had, which the session's
@@ -112,6 +133,29 @@ static struct sockaddr_in sCodePunch;
    seconds, none). One word: type | dp << 4 | time << 8. The host's travels with its other choices (T_HELLO_ACK,
    T_CONFIG); headless.c applies it on both sides when the session enters the versus mode. */
 static uint32_t sRules = 3u << 8; /* single battle, 240 seconds: the game's defaults */
+
+/* The match's seed. A session is a fresh start of the program on both sides with the same fixed seed (plat_sys.c),
+   so the game's random numbers were the same in every session: "Random" at the character select gave the same
+   fighters in the same order every time (reported: Yajirobe, then Cooler). The host draws a number when it starts,
+   it travels behind the host's other choices (T_HELLO_ACK, T_CONFIG), and both copies seed the game's generator
+   with it at the same point, where the session enters the versus mode (headless.c). 0 = leave the generator as it
+   is. BT3_NET_SEED=<n> on the host: that number (tests; 0 for the sequence every session had before). */
+static uint32_t sSeed;
+
+unsigned Port_NetSeed(void) {
+    return sSeed;
+}
+
+static void seed_draw(void) {
+    const char *e = getenv("BT3_NET_SEED");
+    if (e != NULL) {
+        sSeed = (uint32_t)strtoul(e, NULL, 0);
+    } else {
+        do {
+            sSeed = SDL_rand_bits() ^ (uint32_t)SDL_GetTicksNS() ^ (uint32_t)(SDL_GetPerformanceCounter() >> 7);
+        } while (sSeed == 0);
+    }
+}
 
 /* Each player's own two battle options of the game's option menu (save 0x1694: the camera type; 0x1698: the
    screen shake; they become BattleOption.optA / optB of the player's side, battle_load.c). A session starts from
@@ -162,8 +206,10 @@ int Port_NetSideOptions(int *camera, int *shake) {
         return 0;
     }
     for (i = 0; i < 2; i++) {
-        camera[i] = (int)(sOpts[i] & 0xFF);
-        shake[i] = (int)(sOpts[i] >> 8 & 0xFF);
+        /* (the other side's word is whatever its program sent: only the values the options menu can set go into
+           the game, the camera distance 0..2 and the shake on or off; anything else is the default) */
+        camera[i] = (int)(sOpts[i] & 0xFF) > 2 ? 0 : (int)(sOpts[i] & 0xFF);
+        shake[i] = (int)(sOpts[i] >> 8 & 0xFF) > 1 ? 0 : (int)(sOpts[i] >> 8 & 0xFF);
     }
     {
         static int said;
@@ -264,6 +310,7 @@ static int sRollMax, sResim, sRollBegun;
 static uint8_t sUsed[RING][PAD]; /* what the other player's pad read in each blank */
 static uint32_t sChecked;        /* blanks below this were given the other player's real input */
 static uint32_t sLive;           /* during a re-run: the blank that was the present when it began */
+static uint32_t sResimFrom;      /* and the first blank it runs again */
 static unsigned sRollbacks, sRollTicks, sStalls;
 /* Keeping the two copies together in time: each says in its packets how many blanks it is beyond the input it
    has from the other (sTheirAhead). On an even line both numbers are the same; the copy whose clock is ahead has
@@ -305,6 +352,57 @@ static void net_send(const void *buf, int n, const struct sockaddr_in *to) {
     } else if (sendto(sSock, (const char *)buf, n, 0, (const struct sockaddr *)to, sizeof(*to)) != n) {
         sStatErr++;
     }
+}
+
+/* The gameplay fingerprint (plat_fprint.c: one number for the data a fight is computed from) goes to the other side
+   with the greetings, in a packet of its own: {MAGIC, T_FPRINT, FP_MARK, low half, high half}. Two games whose data
+   differ (a modified disc image on one side, or another one on each) compute two different fights: the match ended
+   as a desync at the fight's first moments. Compared only when both sides know theirs, so a copy that does not send
+   it (0.1.37 and older) is let in as before. BT3_TEST_FPRINT=<hex>: testing, this copy claims that value. */
+enum { FP_MARK = 0x46505231 };
+extern int Port_DataFingerprint(unsigned long long *out); /* plat_fprint.c */
+static const char kDataDiffer[] = "Your game data and the other player's are not the same (a modified disc image or mods on one side): "
+                                  "an online match needs the same on both.";
+static int sDataBad; /* the other side's fingerprint differs from this side's */
+
+static int fprint_mine(unsigned long long *fp) {
+    if (Port_DataFingerprint(fp) != 1) {
+        return 0;
+    }
+    if (getenv("BT3_TEST_FPRINT") != NULL) {
+        *fp = strtoull(getenv("BT3_TEST_FPRINT"), NULL, 16);
+    }
+    return 1;
+}
+
+static void fprint_send(const struct sockaddr_in *to) {
+    unsigned long long fp;
+    uint32_t pkt[5] = {MAGIC, T_FPRINT, FP_MARK, 0, 0};
+    if (fprint_mine(&fp)) {
+        pkt[3] = (uint32_t)fp;
+        pkt[4] = (uint32_t)(fp >> 32);
+        net_send(pkt, (int)sizeof(pkt), to);
+    }
+}
+
+/* 1: this T_FPRINT says that the other side's data are not this side's. */
+static int fprint_differs(const uint8_t *pkt, int n) {
+    static unsigned long long said;
+    unsigned long long mine, theirs;
+    uint32_t v[3];
+    if (n < 20 || !fprint_mine(&mine)) {
+        return 0;
+    }
+    memcpy(v, pkt + 8, 12);
+    theirs = (unsigned long long)v[1] | (unsigned long long)v[2] << 32;
+    if (v[0] != FP_MARK || theirs == mine) {
+        return 0;
+    }
+    if (theirs != said) { /* (once: the packet comes again and again) */
+        said = theirs;
+        fprintf(stderr, "bt3: net: the other player's game data are not this game's (gameplay fingerprint %016llx, this one %016llx)\n", theirs, mine);
+    }
+    return 1;
 }
 
 static int net_recv(uint8_t *pkt, int size, struct sockaddr_in *from) {
@@ -357,6 +455,147 @@ static void send_to_peer(const void *buf, int n) {
     net_send(buf, n, &sPeer);
 }
 
+/* Do the two copies still compute the same game? Only button presses are exchanged, so nothing else would say:
+   two copies that have come apart go on, each with its own fight, for good. Every SYNC_EVERY blanks each copy
+   notes a number made of what must be the same on both (Port_NetDigest, headless.c: where the game is, and in a
+   fight both fighters' health and position and the clock). A note counts once the blank is sure: every blank
+   before it was run with the other player's real input (with rollback a blank is run on a guess first and noted
+   again each time it is run again). The newest sure note travels in every input packet; a copy that has a sure
+   note of its own for the same blank compares, and when they differ the match ends on both sides with a message
+   saying so. A dozen bytes a packet and a few hundred bytes hashed twice a second. */
+enum { SYNC_EVERY = 32, SYNC_SLOTS = 64, BYE_APART = 0x41504152 };
+typedef struct { uint32_t tick; uint64_t value; } SyncNote;
+static SyncNote sSyncMine[SYNC_SLOTS], sSyncTheirs[SYNC_SLOTS];
+static uint32_t sSyncOutTick, sByeWhy;
+static unsigned sSyncCompared; /* (for the log: notes of the two copies compared since the last line) */
+static uint64_t sSyncOutValue;
+extern unsigned long long Port_NetDigest(void); /* headless.c */
+static void ended(const char *why, unsigned tick);
+
+/* When the two copies' notes differ, the match goes on (as before 0.1.34, when nothing compared them): the player
+   is told once that the two screens may now show different fights, and the log says where it began and, as the
+   session ends, how many comparisons differed. The setting net_desync_end=1 (or BT3_NET_DESYNC_END=1) ends the
+   match instead, as 0.1.34 to 0.1.37 did. A copy of those releases still ends it, and says so to this one. */
+static uint32_t sApartAt;   /* the first blank whose notes differed (0: none in this session) */
+static unsigned sApartCount;
+
+static int desync_ends(void) {
+    extern int Port_Setting(const char *name, int def);
+    if (getenv("BT3_NET_DESYNC_END") != NULL) {
+        return atoi(getenv("BT3_NET_DESYNC_END")) != 0;
+    }
+    return Port_Setting("net_desync_end", 0) != 0;
+}
+
+/* The game is at the start of blank `tick` (run for the first time or again). */
+static void sync_note(uint32_t tick) {
+    if (tick % SYNC_EVERY == 0) {
+        SyncNote *m = &sSyncMine[tick / SYNC_EVERY % SYNC_SLOTS];
+        m->tick = tick;
+        m->value = Port_NetDigest();
+    }
+}
+
+/* Every blank up to `sure` is as it will stay (and the game is not being run again): what goes out next, and the
+   other copy's notes that can be compared now. */
+static void sync_check(uint32_t sure, unsigned tick) {
+    uint32_t at = sure - sure % SYNC_EVERY;
+    int k;
+
+    if (at != 0 && sSyncMine[at / SYNC_EVERY % SYNC_SLOTS].tick == at) {
+        sSyncOutTick = at;
+        sSyncOutValue = sSyncMine[at / SYNC_EVERY % SYNC_SLOTS].value;
+    }
+    if (getenv("BT3_TEST_APART") != NULL && tick == (unsigned)atoi(getenv("BT3_TEST_APART"))) {
+        sSyncOutValue ^= 1; /* testing: from that blank on this copy claims another game than it has, once */
+    }
+    for (k = 0; k < SYNC_SLOTS; k++) {
+        SyncNote *o = &sSyncTheirs[k];
+        if (o->tick != 0 && o->tick <= sure) {
+            const SyncNote *m = &sSyncMine[k];
+            uint32_t was = o->tick;
+            int differ = m->tick == was && m->value != o->value;
+            o->tick = 0;
+            sSyncCompared += m->tick == was;
+            if (differ) {
+                sApartCount++;
+                if (sApartAt == 0) {
+                    sApartAt = was;
+                    fprintf(stderr, "bt3: net: the two games differ at blank %u (this copy %016llx, the other %016llx)\n", (unsigned)was,
+                            (unsigned long long)m->value, (unsigned long long)o->value);
+                    if (desync_ends()) {
+                        sByeWhy = BYE_APART;
+                        ended("The two games no longer agree (desync): the match has ended.", tick);
+                    }
+                    Port_UiNotice("The two games no longer agree (desync): your screen and the other player's may now show different fights.");
+                }
+            }
+        }
+    }
+}
+
+static void gone(unsigned tick);
+
+/* A wait for the other player's input (roll_tick, Port_NetBeginTick) that lasted 100 ms or more goes to the log with
+   what came from the other side meanwhile: input packets that did not yet carry the blank this copy needs (the
+   other game is behind this one: its machine is slow or stood still for a moment), or nothing at all for most of
+   the wait (the line held the packets back, or the other game stood still and sent nothing). The other copy's log
+   says which of the two machines it was: its slow frames are in it (gs_core.c). The meter shows the same per second.
+   gPortNetWaitNs: the time waited, for the slow-frame report (a frame that only waited is not a slow machine). */
+enum { WAIT_NOTE_MS = 100, WAIT_NOTES = 200, WHY_BEHIND = 1, WHY_SILENT = 2 };
+static unsigned sInPkts;        /* input packets taken */
+static uint64_t sInLastNs;      /* when the last one came */
+static uint64_t sInGapNs;       /* the longest time without one since the wait began */
+static unsigned sWaitNotes;     /* lines written in this session */
+static uint64_t sSecWaitMaxNs;  /* the longest wait of this second, and why it was */
+static int sSecWaitWhy;
+uint64_t gPortNetWaitNs;
+
+typedef struct { uint64_t t0; unsigned pkts; } WaitMark;
+
+static WaitMark wait_begin(uint64_t t0) {
+    WaitMark w;
+    w.t0 = t0;
+    w.pkts = sInPkts;
+    sInGapNs = sInLastNs != 0 && t0 > sInLastNs ? t0 - sInLastNs : 0;
+    return w;
+}
+
+static void wait_end(WaitMark w, unsigned tick) {
+    uint64_t now = SDL_GetTicksNS(), took = now - w.t0, gap = sInGapNs;
+    unsigned got = sInPkts - w.pkts;
+    int why;
+
+    gPortNetWaitNs += took;
+    if (now > sInLastNs && now - sInLastNs > gap) {
+        gap = now - sInLastNs;
+    }
+    why = gap * 10 >= took * 8 ? WHY_SILENT : WHY_BEHIND;
+    if (took > sSecWaitMaxNs) {
+        sSecWaitMaxNs = took;
+        sSecWaitWhy = why;
+    }
+    if (took < (uint64_t)WAIT_NOTE_MS * 1000000ull || sWaitNotes >= WAIT_NOTES) {
+        return;
+    }
+    sWaitNotes++;
+    if (why == WHY_SILENT) {
+        fprintf(stderr, "bt3: net: waited %u ms at blank %u for the other player's input: nothing came from them for %u ms (the line held it back, "
+                        "or their game stood still); ping %d ms\n", (unsigned)(took / 1000000ull), tick, (unsigned)(gap / 1000000ull), sPingMs);
+    } else {
+        fprintf(stderr, "bt3: net: waited %u ms at blank %u for the other player's input: %u packets came meanwhile without it (their game is "
+                        "behind this one; they say they are %d blanks ahead); ping %d ms\n", (unsigned)(took / 1000000ull), tick, got, (int)sTheirAhead, sPingMs);
+    }
+}
+
+/* The meeting at the end of a session's start-up (warp_tick, meet): the blank at which each copy reached the
+   character select. A copy that is waiting sends {MAGIC, T_ARRIVED, blank, 0}; one that has arrived answers each such
+   greeting with {..., 1}, so a lost packet costs a resend and the two never go on answering each other. */
+enum { T_ARRIVED = 11 };
+static uint32_t sMyArrival, sTheirArrival; /* (0: not yet) */
+static int sMet;
+static char sBannerSaid[NAME_LEN + 8]; /* what session_banner last put up (empty: nothing yet in this session) */
+
 static void send_inputs(void) {
     uint8_t pkt[IN_HEAD + REDUNDANT * PAD];
     uint32_t tsend = now_ms(), techo = sEchoTs, thold = sEchoTs != 0 ? tsend - sEchoAtMs : 0;
@@ -372,10 +611,25 @@ static void send_inputs(void) {
     memcpy(pkt + 20, &tsend, 4); /* for the ping: when this left, */
     memcpy(pkt + 24, &techo, 4); /* the other side's last such time that arrived here, */
     memcpy(pkt + 28, &thold, 4); /* and how long ago that was */
+    memcpy(pkt + 32, &sSyncOutTick, 4); /* the check: the newest blank this copy is sure of, */
+    memcpy(pkt + 36, &sSyncOutValue, 8); /* and what the game was at it (Port_NetDigest) */
     for (i = 0; i < n; i++) {
         memcpy(pkt + IN_HEAD + i * PAD, sIn[sMe][(base + i) % RING], PAD);
     }
     send_to_peer(pkt, (int)(IN_HEAD + n * PAD));
+}
+
+/* The lines of text that are due to go to the other player (net_chat.c: each is sent a few times). */
+static void chat_send(void) {
+    uint8_t pkt[16 + CHAT_TEXT];
+    uint32_t head[4] = {MAGIC, T_CHAT};
+    int len;
+
+    while (sConnected && (len = PortChat_Outgoing(now_ms(), &head[2], (char *)pkt + 16)) > 0) {
+        head[3] = (uint32_t)len;
+        memcpy(pkt, head, 16);
+        send_to_peer(pkt, 16 + len);
+    }
 }
 
 /* Takes in what has arrived. Returns 1 if anything did. */
@@ -386,6 +640,7 @@ static int receive(void) {
     int got = 0, n;
 
     queue_flush();
+    chat_send();
     while ((n = net_recv(pkt, (int)sizeof(pkt), &from)) >= 8) {
         uint32_t magic, type;
         memcpy(&magic, pkt, 4);
@@ -424,12 +679,26 @@ static int receive(void) {
             if (n >= 28 + NAME_LEN) {
                 opts_take(0, pkt + 24 + NAME_LEN);
             }
+            if (n >= 32 + NAME_LEN) {
+                memcpy(&sSeed, pkt + 28 + NAME_LEN, 4);
+            }
             sCfgGot = 2;
             net_send(ack, sizeof(ack), &from);
         } else if (type == T_CONFIG_ACK && sMode == 1) {
             sCfgAcked = 1;
+        } else if (type == T_CHAT && sConnected && n >= 16) { /* (from the other player's address only: above) */
+            uint32_t seq, len;
+            memcpy(&seq, pkt + 8, 4);
+            memcpy(&len, pkt + 12, 4);
+            if (len <= CHAT_TEXT && len <= (uint32_t)(n - 16)) {
+                PortChat_Heard(seq, (const char *)pkt + 16, (int)len);
+            }
         } else if (type == T_BYE && sConnected) {
-            sGone = 1;
+            uint32_t why = 0;
+            if (n >= 12) {
+                memcpy(&why, pkt + 8, 4);
+            }
+            sGone = why == BYE_APART ? 2 : 1;
         } else if (type == T_HELLO && sMode == 1 && !(n >= 12 && memcmp(pkt + 8, &kVersion, 4) == 0)) {
             static int said;
             if (!said++) {
@@ -441,7 +710,8 @@ static int receive(void) {
             uint32_t ack[3] = {MAGIC, T_HELLO_ACK, NET_VERSION};
             net_send(ack, sizeof(ack), &from);
         } else if (type == T_HELLO && sMode == 1) {
-            uint32_t ack[7 + NAME_LEN / 4] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+            uint32_t ack[8 + NAME_LEN / 4] = {MAGIC, T_HELLO_ACK, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+            ack[7 + NAME_LEN / 4] = sSeed;
             memcpy(&ack[6], sMyName, NAME_LEN);
             ack[6 + NAME_LEN / 4] = sOpts[0];
             if (n >= 12 + NAME_LEN) { /* the other player's name came with the greeting */
@@ -491,17 +761,47 @@ static int receive(void) {
                 if (n >= 28 + NAME_LEN) {
                     opts_take(0, pkt + 24 + NAME_LEN);
                 }
+                if (n >= 32 + NAME_LEN) {
+                    memcpy(&sSeed, pkt + 28 + NAME_LEN, 4);
+                }
                 memcpy(sNames[1], sMyName, NAME_LEN);
                 sCfgGot = 1;
                 sConnected = 1;
             }
+        } else if (type == T_FPRINT) {
+            sDataBad |= fprint_differs(pkt, n);
+        } else if (type == T_ARRIVED && sConnected && n >= 16) {
+            uint32_t v[2];
+            memcpy(v, pkt + 8, 8);
+            sTheirArrival = v[0];
+            if (v[1] == 0 && sMyArrival != 0) {
+                uint32_t answer[4] = {MAGIC, T_ARRIVED, sMyArrival, 1};
+                send_to_peer(answer, (int)sizeof(answer));
+            }
         } else if (type == T_INPUT && n >= IN_HEAD && (sConnected || sMode == 1)) { /* (the joining side: not before the host's answer) */
             uint32_t base, count, i, other = (uint32_t)!sMe;
+            {
+                uint64_t at = SDL_GetTicksNS();
+                if (sInLastNs != 0 && at - sInLastNs > sInGapNs) {
+                    sInGapNs = at - sInLastNs;
+                }
+                sInLastNs = at;
+                sInPkts++;
+            }
             memcpy(&base, pkt + 8, 4);
             memcpy(&count, pkt + 12, 4);
             memcpy(&sTheirAhead, pkt + 16, 4);
             if (sMode == 1 && !sConnected) {
                 sPeer = from;
+            }
+            {
+                uint32_t at;
+                memcpy(&at, pkt + 32, 4);
+                if (at != 0) { /* the other copy's check value for that blank: compared when this copy is sure of it too */
+                    SyncNote *o = &sSyncTheirs[at / SYNC_EVERY % SYNC_SLOTS];
+                    o->tick = at;
+                    memcpy(&o->value, pkt + 36, 8);
+                }
             }
             sConnected = 1; /* (an input packet says the greeting got through) */
             {
@@ -539,8 +839,26 @@ static int receive(void) {
     return got;
 }
 
+/* Testing: this copy behaves like a weak machine (real time only; nothing of the game's state may follow from it).
+     BT3_TEST_SLOW_READ=<ms>    every file read of the game takes that long more (what = 0)
+     BT3_TEST_SLOW_START=<ms>   that long between the connection and the session's first blank (what = 1)
+     BT3_TEST_SLOW_BLANK=<ms>   every blank of a match takes that long more (what = 2) */
+void Port_TestSlow(int what, int amount) {
+    static int ms[3] = {-1, -1, -1};
+    (void)amount;
+    if (ms[0] < 0) {
+        ms[0] = getenv("BT3_TEST_SLOW_READ") != NULL ? atoi(getenv("BT3_TEST_SLOW_READ")) : 0;
+        ms[1] = getenv("BT3_TEST_SLOW_START") != NULL ? atoi(getenv("BT3_TEST_SLOW_START")) : 0;
+        ms[2] = getenv("BT3_TEST_SLOW_BLANK") != NULL ? atoi(getenv("BT3_TEST_SLOW_BLANK")) : 0;
+    }
+    if (what >= 0 && what < 3 && ms[what] > 0) {
+        SDL_Delay((Uint32)ms[what]);
+    }
+}
+
 static int sSession; /* a session started from Dragon Net Battle (below), not a plain connected run */
 static int sArrived; /* its start-up has reached the character select */
+static uint32_t sStartedMs; /* when the two were connected (for the log) */
 
 /* Connects: role 1 hosts on `port`, role 2 joins `join` ("address:port"). Waits until the other side is there. */
 static void net_start(int role, const char *host, const char *join) {
@@ -553,6 +871,7 @@ static void net_start(int role, const char *host, const char *join) {
     sTick = 0;
     memset(sIn, 0, sizeof(sIn));
     memset(sHave, 0, sizeof(sHave)); /* (a second session in one run starts as clean as the first) */
+    PortChat_Reset();
     sWaitNs = sWaits = 0;
     sFromLobby = sHandSock >= 0;
     if (sFromLobby) {
@@ -608,10 +927,16 @@ static void net_start(int role, const char *host, const char *join) {
     sCfgGot = 0;
     sGone = 0;
     sVersionBad = 0;
+    sDataBad = 0;
     sEchoTs = 0;
     sPingMs = -1;
     sSecRoll = sSecRollTicks = sSecWaits = sSecWaitMs = sSecTicks = 0;
     memset(sShown, 0, sizeof(sShown));
+    sApartAt = 0;
+    sApartCount = 0;
+    sInPkts = sWaitNotes = 0;
+    sInLastNs = sInGapNs = sSecWaitMaxNs = 0;
+    sSecWaitWhy = 0;
     sLoss = getenv("BT3_NET_LOSS") != NULL ? atoi(getenv("BT3_NET_LOSS")) : 0;
     sLagMs = getenv("BT3_NET_LAG") != NULL ? atoi(getenv("BT3_NET_LAG")) : 0;
     sLatencyMs = getenv("BT3_NET_LATENCY") != NULL ? atoi(getenv("BT3_NET_LATENCY")) : 0;
@@ -623,6 +948,11 @@ static void net_start(int role, const char *host, const char *join) {
     if (sRollMax > 30) { sRollMax = 30; }
     sChecked = sLive = 0;
     sResim = sRollBegun = 0;
+    memset(sSyncMine, 0, sizeof(sSyncMine));
+    memset(sSyncTheirs, 0, sizeof(sSyncTheirs));
+    sSyncOutTick = 0;
+    sSyncOutValue = 0;
+    sByeWhy = 0;
     sTheirAhead = 0;
     sBalance = 0;
     sRollbacks = sRollTicks = sStalls = 0;
@@ -634,7 +964,9 @@ static void net_start(int role, const char *host, const char *join) {
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     memset(&sPeer, 0, sizeof(sPeer));
     sPeer.sin_family = AF_INET;
+    sSeed = 0;
     if (sMode == 1) {
+        seed_draw();
         local.sin_port = htons((uint16_t)atoi(host));
         if (!sFromLobby && bind(sSock, (struct sockaddr *)&local, sizeof(local)) != 0) {
             fprintf(stderr, "bt3: net: cannot use port %s\n", host);
@@ -687,10 +1019,12 @@ static void net_start(int role, const char *host, const char *join) {
             memcpy(&hello[3], sMyName, NAME_LEN);
             hello[3 + NAME_LEN / 4] = sOpts[1];
             hello[4 + NAME_LEN / 4] = CAP_MARK | 3;
+            fprint_send(&sPeer);
             net_send(hello, sizeof(hello), &sPeer);
             last = now;
         }
         receive();
+        session_hold();
         if (sVersionBad) {
             fprintf(stderr, "bt3: net: the other player's game is another version; both need the same release\n");
             Port_UiNotice("The other player's game is a different version.");
@@ -716,10 +1050,12 @@ static void net_start(int role, const char *host, const char *join) {
             if (pings < 12 && now - lastPing >= 25000000ull) {
                 uint32_t ping[3] = {MAGIC, T_PING, now_ms()};
                 send_to_peer(ping, (int)sizeof(ping));
+                fprint_send(&sPeer);
                 lastPing = now;
                 pings++;
             }
             receive();
+            session_hold();
             SDL_Delay(1);
         }
         if (sAutoDelay) {
@@ -730,19 +1066,26 @@ static void net_start(int role, const char *host, const char *join) {
         while (!sCfgAcked && SDL_GetTicksNS() - start < 3000000000ull) {
             uint64_t now = SDL_GetTicksNS();
             if (now - lastCfg >= 50000000ull) {
-                uint32_t cfg[7 + NAME_LEN / 4] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+                uint32_t cfg[8 + NAME_LEN / 4] = {MAGIC, T_CONFIG, (uint32_t)sDelay, (uint32_t)sRollMax, NET_VERSION, sRules};
+                cfg[7 + NAME_LEN / 4] = sSeed;
                 memcpy(&cfg[6], sMyName, NAME_LEN);
                 cfg[6 + NAME_LEN / 4] = sOpts[0];
                 net_send(cfg, sizeof(cfg), &sPeer);
                 lastCfg = now;
             }
             receive();
+            session_hold();
             SDL_Delay(1);
         }
     } else {
-        uint64_t start = SDL_GetTicksNS();
+        uint64_t start = SDL_GetTicksNS(), lastFp = 0;
         while (sCfgGot != 2 && SDL_GetTicksNS() - start < 5000000000ull) {
+            if (SDL_GetTicksNS() - lastFp >= 50000000ull) {
+                fprint_send(&sPeer);
+                lastFp = SDL_GetTicksNS();
+            }
             receive();
+            session_hold();
             SDL_Delay(1);
         }
     }
@@ -753,6 +1096,13 @@ static void net_start(int role, const char *host, const char *join) {
         if (getenv("BT3_NET_ROLLBACK") == NULL && sOptRoll < 0 && sCfgRoll >= 0 && sCfgRoll <= 30) {
             sRollMax = Port_RollCan() ? sCfgRoll : 0;
         }
+    }
+    if (sDataBad) {
+        Port_UiNotice(kDataDiffer);
+        if (sSession) {
+            Port_NetLeave();
+        }
+        exit(2);
     }
     /* the blanks before any input can have arrived (0 .. delay) are idle for both players */
     for (i = 0; i <= (uint32_t)sDelay; i++) {
@@ -772,6 +1122,8 @@ static void net_start(int role, const char *host, const char *join) {
     if (sRollMax > 0) {
         fprintf(stderr, "bt3: net: rollback of up to %d blanks\n", sRollMax);
     }
+    sStartedMs = now_ms();
+    Port_TestSlow(1, 0);
 }
 
 int Port_NetActive(void);
@@ -886,6 +1238,11 @@ static void ended(const char *why, unsigned tick) {
     exit(2);
 }
 
+/* The other copy said goodbye. */
+static void gone(unsigned tick) {
+    ended(sGone == 2 ? "The two games no longer agree (desync): the match has ended." : "The other player left the match.", tick);
+}
+
 static void gone_quiet(unsigned tick) {
     ended("The connection to the other player was lost.", tick);
 }
@@ -905,36 +1262,44 @@ static void roll_tick(unsigned tick) {
         sRollBegun = 1;
         sChecked = tick; /* nothing was given to an earlier blank */
     }
+    sync_note(tick); /* (the game as this blank finds it, whether the blank is new or run again) */
     if (sResim && tick >= sLive) {
+        extern void PortSe_RunAgainEnds(unsigned first, unsigned live); /* snd_se.c */
         sResim = 0; /* caught up: this blank is the present again */
+        PortSe_RunAgainEnds(sResimFrom, sLive);
     }
     if (!sResim) {
+        extern void PortSe_BlankBegins(unsigned tick); /* snd_se.c: which effects this blank starts */
+        PortSe_BlankBegins(tick);
+        Port_TestSlow(2, 0);
         sample_local(tick);
         send_inputs();
         receive();
         if (sGone) {
-            ended("The other player left the match.", tick);
+            gone(tick);
         }
         t0 = last = SDL_GetTicksNS();
         if (tick >= sHave[other] + (uint32_t)sRollMax) {
+            WaitMark w = wait_begin(t0);
             sStalls++;
             sSecWaits++;
-        }
-        while (tick >= sHave[other] + (uint32_t)sRollMax) {
-            uint64_t now = SDL_GetTicksNS();
-            if (now - last > 4000000ull) {
-                send_inputs();
-                last = now;
+            while (tick >= sHave[other] + (uint32_t)sRollMax) {
+                uint64_t now = SDL_GetTicksNS();
+                if (now - last > 4000000ull) {
+                    send_inputs();
+                    last = now;
+                }
+                if (!receive()) {
+                    SDL_DelayNS(200000);
+                }
+                if (sGone) {
+                    gone(tick);
+                }
+                if (now - t0 > QUIET_NS) {
+                    gone_quiet(tick);
+                }
             }
-            if (!receive()) {
-                SDL_DelayNS(200000);
-            }
-            if (sGone) {
-                ended("The other player left the match.", tick);
-            }
-            if (now - t0 > QUIET_NS) {
-                gone_quiet(tick);
-            }
+            wait_end(w, tick);
         }
         {   /* (see sTheirAhead) */
             int diff = (int)sMyAhead - (int)sTheirAhead; /* (both taken at the same point of a blank: when sending) */
@@ -953,7 +1318,9 @@ static void roll_tick(unsigned tick) {
             sShown[2] = sSecRoll != 0 ? (int)(sSecRollTicks * 10 / sSecRoll) : 0;
             sShown[3] = (int)sSecWaits;
             sShown[4] = (int)sSecWaitMs;
+            sShown[5] = sSecWaitMaxNs >= 30000000ull ? sSecWaitWhy : 0;
             sSecRoll = sSecRollTicks = sSecWaits = sSecWaitMs = sSecTicks = 0;
+            sSecWaitMaxNs = 0;
         }
         limit = sHave[other] < tick ? sHave[other] : tick;
         for (t = sChecked; t < limit && memcmp(sUsed[t % RING], sIn[other][t % RING], PAD) == 0; t++) {
@@ -961,6 +1328,7 @@ static void roll_tick(unsigned tick) {
         sChecked = t;
         if (t < limit) { /* blank t was given something else than what they really pressed */
             sLive = tick;
+            sResimFrom = t;
             sResim = 1;
             sRollbacks++;
             sRollTicks += tick - t;
@@ -969,10 +1337,11 @@ static void roll_tick(unsigned tick) {
             gPortResim = 1;
             Port_RollBack((int)(tick - t)); /* does not return: goes on after blank t's Port_RollSave below */
         }
+        sync_check(sChecked, tick); /* (every blank below sChecked was run with their real input) */
         if (tick % 600 == 0 && getenv("BT3_GS_VERBOSE") != NULL) {
-            fprintf(stderr, "net: blank %u: %u rollbacks (%.1f blanks each), %u waits in the last 600 blanks; ahead %d, they %d, slowed %u ms\n", tick, sRollbacks,
-                    sRollbacks != 0 ? (double)sRollTicks / sRollbacks : 0.0, sStalls, (int)sMyAhead, (int)sTheirAhead, sSlowed);
-            sRollbacks = sRollTicks = sStalls = sSlowed = 0;
+            fprintf(stderr, "net: blank %u: %u rollbacks (%.1f blanks each), %u waits in the last 600 blanks; ahead %d, they %d, slowed %u ms; %u checks against the other copy\n", tick, sRollbacks,
+                    sRollbacks != 0 ? (double)sRollTicks / sRollbacks : 0.0, sStalls, (int)sMyAhead, (int)sTheirAhead, sSlowed, sSyncCompared);
+            sRollbacks = sRollTicks = sStalls = sSlowed = sSyncCompared = 0;
         }
     }
     if (Port_RollSave() != 0) {
@@ -982,6 +1351,128 @@ static void roll_tick(unsigned tick) {
     memcpy(sUsed[tick % RING], sIn[other][(tick < sHave[other] ? tick : sHave[other] - 1) % RING], PAD);
 }
 
+/* What the screen says while a session starts (the picture stands still meanwhile: Gs_HoldFrame keeps showing it
+   with this line on it). Before the other player's name is known: that their game is being reached; then that they
+   are there, by name. The lines are the port catalog's (net/connecting, net/rival_here; {name} is replaced). */
+static void session_banner(void) {
+    const char *other = sNames[!sMe], *line;
+    char text[256], name[NAME_LEN];
+    size_t i, k, n;
+
+    if (!sSession) {
+        return;
+    }
+    for (i = k = 0; other[i] != '\0' && k + 1 < sizeof(name); i++) { /* (the other side's text: printable only) */
+        if ((unsigned char)other[i] >= 0x20 && other[i] != 0x7F) {
+            name[k++] = other[i];
+        }
+    }
+    name[k] = '\0';
+    if (strcmp(sBannerSaid, k != 0 ? name : "\x01") == 0) {
+        return;
+    }
+    snprintf(sBannerSaid, sizeof(sBannerSaid), "%s", k != 0 ? name : "\x01");
+    if (k == 0) {
+        line = MenuTranslation_PortText("net/connecting");
+        Port_UiBanner(line != NULL ? line : "Connecting to your rival...", 0);
+        return;
+    }
+    line = MenuTranslation_PortText("net/rival_here");
+    if (line == NULL) {
+        line = "Your rival \"{name}\" is here! The match begins.";
+    }
+    for (i = n = 0; line[i] != '\0' && n + 1 < sizeof(text); i++) {
+        if (strncmp(line + i, "{name}", 6) == 0) {
+            for (k = 0; name[k] != '\0' && n + 1 < sizeof(text); k++) {
+                text[n++] = name[k];
+            }
+            i += 5;
+        } else {
+            text[n++] = line[i];
+        }
+    }
+    text[n] = '\0';
+    Port_UiBanner(text, 0);
+}
+
+/* While the game's thread waits for the other side during a session's start: the line, and the picture. */
+static void session_hold(void) {
+    if (sSession) {
+        session_banner();
+        Gs_HoldFrame();
+    }
+}
+
+/* A blank of a session's start-up (the logos and the card check, without picture, up to the character select:
+   Port_NetWarp). Nobody plays it, so both copies give it nothing pressed for both players and go on without
+   waiting for each other: the two run the same blanks from the same first blank with the same input and arrive at
+   the character select in the same state, at their own speed (it was the round trip per blank or two: half a
+   minute at 100 ms). The check values still travel (with a packet a tenth of a second, which also keeps the line
+   open) and are compared as always. */
+static void warp_tick(unsigned tick) {
+    static uint64_t last;
+    uint64_t now = SDL_GetTicksNS();
+    uint32_t at = (uint32_t)tick + (uint32_t)sDelay, k;
+
+    for (k = 0; k < 2; k++) {
+        while (sHave[k] <= at) {
+            memcpy(sIn[k][sHave[k] % RING], kIdle, PAD);
+            sHave[k]++;
+        }
+    }
+    memcpy(sUsed[tick % RING], kIdle, PAD); /* (what the rollback's reading of the other pad gives) */
+    sync_note(tick);
+    sync_check(tick, tick);
+    if (now - last > 100000000ull) {
+        send_inputs();
+        last = now;
+    }
+    receive();
+    if (sGone) {
+        gone(tick);
+    }
+    session_hold();
+    gPortResim = 1;
+}
+
+/* The first blank after the start-up: waits for the other copy to have arrived too (a slower machine may take a
+   while: a minute is allowed), and both must have arrived at the same blank, or the two games are not the same. */
+static void meet(unsigned tick) {
+    uint64_t t0 = SDL_GetTicksNS(), last = 0;
+
+    sMet = 1;
+    sMyArrival = tick;
+    do {
+        uint64_t now = SDL_GetTicksNS();
+        if (last == 0 || now - last > 50000000ull) {
+            uint32_t hello[4] = {MAGIC, T_ARRIVED, tick, 0};
+            send_to_peer(hello, (int)sizeof(hello));
+            last = now;
+        }
+        if (sTheirArrival != 0) {
+            break;
+        }
+        if (!receive()) {
+            SDL_DelayNS(200000);
+        }
+        if (sGone) {
+            gone(tick);
+        }
+        if (now - t0 > 60000000000ull) {
+            gone_quiet(tick);
+        }
+        session_hold();
+    } while (sTheirArrival == 0);
+    session_banner();
+    Port_UiBanner(NULL, 2500); /* (the line stays a little over the character select, without the dimming) */
+    fprintf(stderr, "bt3: net: both at the character select (blank %u), %u ms after connecting\n", tick, (unsigned)(now_ms() - sStartedMs));
+    if (sTheirArrival != tick) {
+        fprintf(stderr, "bt3: net: the other copy reached the character select at blank %u\n", (unsigned)sTheirArrival);
+        sByeWhy = BYE_APART;
+        ended("The two games no longer agree (desync): the match has ended.", tick);
+    }
+}
+
 void Port_NetBeginTick(unsigned tick) {
     uint64_t t0, last;
 
@@ -989,6 +1480,13 @@ void Port_NetBeginTick(unsigned tick) {
         return;
     }
     sTick = tick;
+    if (Port_NetWarp()) {
+        warp_tick(tick);
+        return;
+    }
+    if (Port_NetSession() && !sMet) {
+        meet(tick);
+    }
     if (sRollMax > 0) {
         roll_tick(tick);
         return;
@@ -1000,24 +1498,30 @@ void Port_NetBeginTick(unsigned tick) {
     send_inputs();
     receive();
     t0 = last = SDL_GetTicksNS();
-    while (sHave[!sMe] <= tick) {
-        uint64_t now = SDL_GetTicksNS();
-        if (now - last > 4000000ull) {
-            send_inputs(); /* the other side may be waiting for a packet that was lost */
-            last = now;
+    if (sHave[!sMe] <= tick) {
+        WaitMark w = wait_begin(t0);
+        while (sHave[!sMe] <= tick) {
+            uint64_t now = SDL_GetTicksNS();
+            if (now - last > 4000000ull) {
+                send_inputs(); /* the other side may be waiting for a packet that was lost */
+                last = now;
+            }
+            if (!receive()) {
+                SDL_DelayNS(200000);
+            }
+            if (sGone) {
+                gone(tick);
+            }
+            if (now - t0 > QUIET_NS) {
+                gone_quiet(tick);
+            }
         }
-        if (!receive()) {
-            SDL_DelayNS(200000);
-        }
-        if (sGone) {
-            ended("The other player left the match.", tick);
-        }
-        if (now - t0 > QUIET_NS) {
-            gone_quiet(tick);
-        }
+        wait_end(w, tick);
     }
     sWaitNs += SDL_GetTicksNS() - t0;
     sWaits++;
+    sync_note(tick); /* (nothing is guessed here: every blank is sure when it begins) */
+    sync_check(tick, tick);
     {   /* (the meter, when the two copies wait for each other every blank: time waited, and blanks that waited
            more than a millisecond) */
         unsigned ms = (unsigned)((SDL_GetTicksNS() - t0) / 1000000ull);
@@ -1027,12 +1531,16 @@ void Port_NetBeginTick(unsigned tick) {
             sShown[1] = sShown[2] = 0;
             sShown[3] = (int)sSecWaits;
             sShown[4] = (int)sSecWaitMs;
+            sShown[5] = sSecWaitMaxNs >= 30000000ull ? sSecWaitWhy : 0;
             sSecWaits = sSecWaitMs = sSecTicks = 0;
+            sSecWaitMaxNs = 0;
         }
     }
     if (tick % 600 == 0 && getenv("BT3_GS_VERBOSE") != NULL) {
-        fprintf(stderr, "net: blank %u: waited for the other player %.2f ms per blank on average\n", tick, (double)sWaitNs / (double)sWaits / 1e6);
+        fprintf(stderr, "net: blank %u: waited for the other player %.2f ms per blank on average; %u checks against the other copy\n", tick, (double)sWaitNs / (double)sWaits / 1e6,
+                sSyncCompared);
         sWaitNs = sWaits = 0;
+        sSyncCompared = 0;
     }
 }
 
@@ -1047,6 +1555,11 @@ void Port_NetInput(int player, unsigned char *data) {
 
 int Port_NetResim(void) {
     return sResim;
+}
+
+/* The blank the game is in (run for the first time or again). */
+unsigned Port_NetTick(void) {
+    return sTick;
 }
 
 /* Which player's view this copy shows full screen in a two-player battle: the local player's when online; -1
@@ -1091,6 +1604,9 @@ static void relaunch(int role, const char *join, int port) {
     PROCESS_INFORMATION pi;
 #define SETENV(n, v) SetEnvironmentVariableA(n, v)
 #else
+#ifdef __APPLE__
+    char exe[1024];
+#endif
 #define SETENV(n, v) ((v) != NULL ? setenv(n, v, 1) : unsetenv(n))
 #endif
     SETENV("BT3_NET_HOST", NULL);
@@ -1149,6 +1665,15 @@ static void relaunch(int role, const char *join, int port) {
     if (CreateProcessA(exe, NULL, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
         ExitProcess(0);
     }
+#elif defined(__APPLE__)
+    {
+        extern int _NSGetExecutablePath(char *buf, uint32_t *size); /* <mach-o/dyld.h> */
+        uint32_t cap = sizeof(exe) - 1;
+        if (_NSGetExecutablePath(exe, &cap) == 0) {
+            char *argv[2] = {exe, NULL};
+            execv(exe, argv);
+        }
+    }
 #else
     {
         char *argv[2] = {(char *)"/proc/self/exe", NULL};
@@ -1159,9 +1684,50 @@ static void relaunch(int role, const char *join, int port) {
     exit(2);
 }
 
+/* Restart after changing the menu language, keeping the player's launch environment. */
+void Port_Restart(const char *language) {
+    const char *settings = getenv("BT3_SETTINGS");
+    /* With settings disabled, carry this run's choice through the restart. */
+    if (settings != NULL && settings[0] == '\0' && language != NULL) {
+#ifdef _WIN32
+        SetEnvironmentVariableA("BT3_MENU_LANG", language);
+        _putenv_s("BT3_MENU_LANG", language);
+#else
+        setenv("BT3_MENU_LANG", language, 1);
+#endif
+    }
+    fflush(NULL);
+#ifdef _WIN32
+    char exe[1024];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    GetModuleFileNameA(NULL, exe, sizeof(exe) - 1);
+    memset(&si, 0, sizeof(si));
+    si.cb = sizeof(si);
+    if (CreateProcessA(exe, NULL, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) ExitProcess(0);
+#elif defined(__APPLE__)
+    char exe[1024];
+    uint32_t cap = sizeof(exe) - 1;
+    extern int _NSGetExecutablePath(char *buf, uint32_t *size);
+    if (_NSGetExecutablePath(exe, &cap) == 0) { char *argv[2] = {exe, NULL}; execv(exe, argv); }
+#else
+    char *argv[2] = {(char *)"/proc/self/exe", NULL};
+    execv("/proc/self/exe", argv);
+#endif
+    fprintf(stderr, "bt3: language: could not restart the program\n");
+    exit(2);
+}
+
 /* 1 in a session started from Dragon Net Battle. */
 int Port_NetSession(void) {
     return Port_NetActive() && sSession;
+}
+
+/* For the game's start-up (src/menu/menu_i_c.c, menu_a_c.c): 1 when it has to be the game's own whatever the
+   player's settings say, which is in every session. BT3_TEST_OWN_START=1 (testing the check above): this copy
+   follows its settings in a session too, as 0.1.32 and 0.1.33 did. */
+int Port_NetFixedStart(void) {
+    return Port_NetSession() && getenv("BT3_TEST_OWN_START") == NULL;
 }
 
 /* The session without starting the program again (gs/state.c exchanges the game's state; 64-bit programs).
@@ -1205,10 +1771,22 @@ void Port_NetSessionBegin(int role, const char *address, int port) {
     }
     sSession = 1;
     sArrived = 0;
+    sMyArrival = sTheirArrival = 0;
+    sMet = 0;
+    sBannerSaid[0] = 0;
     net_start(role, role == 1 ? host : NULL, role == 2 ? join : NULL);
 }
 
+/* How many sessions have ended in this run. The port's own memory: the game's is put back to the moment the session
+   was asked for, so this is how the screens that asked for it (menu/port_tbo.c) know it has been and gone. */
+static int sSessionsEnded;
+
+int Port_NetSessionsEnded(void) {
+    return sSessionsEnded;
+}
+
 void Port_NetSessionEnd(void) {
+    sSessionsEnded++;
     Relay_Close(sSock);
     if (sSock >= 0) {
         closesocket(sSock);
@@ -1216,6 +1794,7 @@ void Port_NetSessionEnd(void) {
     }
     sMode = 0;
     sSession = 0;
+    PortChat_Reset();
     put_env("BT3_SAVES", sSavesWasSet ? sSavesBefore : NULL);
 }
 
@@ -1226,14 +1805,19 @@ int Port_NetWarp(void) {
 }
 void Port_NetArrived(void) {
     sArrived = 1;
+    fprintf(stderr, "bt3: net: the start-up is over at blank %u, %u ms after connecting: the character select\n", (unsigned)sTick, (unsigned)(now_ms() - sStartedMs));
 }
 
 /* The session is over (the game went back to the main menu, or the other side is gone): back to the game as it
    normally is. */
 void Port_NetLeave(void) {
     fprintf(stderr, "bt3: net: the session has ended\n");
+    if (sApartAt != 0) {
+        fprintf(stderr, "bt3: net: the two games differed from blank %u on (%u comparisons differed)\n", (unsigned)sApartAt, sApartCount);
+    }
+    PortChat_Reset();
     if (sSock >= 0 && sConnected) { /* tell the other side, so that it does not wait for input that will not come */
-        uint32_t bye[2] = {MAGIC, T_BYE};
+        uint32_t bye[3] = {MAGIC, T_BYE, sByeWhy};
         int k;
         for (k = 0; k < 3; k++) {
             net_send(bye, sizeof(bye), &sPeer);
@@ -1263,7 +1847,7 @@ static int sCodeSeenSet, sCodeGen, sCodeRelayGen; /* ... and which of the search
 
 int Port_LobbyRelayed(void) { return sCodeVia; }
 static struct sockaddr_in sCodeAddr[MATCH_ADDRS];
-static char sCodeText[8], sCodeError[96];
+static char sCodeText[8], sCodeError[192];
 static uint64_t sCodeSince;
 
 const char *Port_LobbyCode(void) { return sCodeText; }
@@ -1495,6 +2079,7 @@ int Port_LobbyPoll(void) {
                              nothing else, also while there is no relay address yet) */
             }
             if (sLobbyRole == 2) {
+                fprint_send(&sCodeAddr[i]);
                 net_send(hello, sizeof(hello), &sCodeAddr[i]);
             } else {
                 net_send(punch, sizeof(punch), &sCodeAddr[i]);
@@ -1508,6 +2093,7 @@ int Port_LobbyPoll(void) {
         }
     } else if (!sCodeMode && sLobbyRole == 2 && now - sLobbyLast > 200000000ull) {
         uint32_t hello[3] = {MAGIC, T_HELLO, NET_VERSION};
+        fprint_send(&sPeer);
         net_send(hello, sizeof(hello), &sPeer);
         sLobbyLast = now;
     }
@@ -1518,11 +2104,20 @@ int Port_LobbyPoll(void) {
         if (magic != MAGIC) {
             continue;
         }
-        if (sLobbyRole == 1 && type == T_HELLO && !(n >= 12 && memcmp(pkt + 8, &kVersion, 4) == 0)) {
+        if (type == T_FPRINT && fprint_differs(pkt, n)) {
+            /* not the same game data: no match (the host answers with its own, so that the other side knows too) */
+            if (sLobbyRole == 1) {
+                fprint_send(&from);
+            }
+            snprintf(sCodeError, sizeof(sCodeError), "%s", kDataDiffer);
+            sLobby = -3;
+            return sLobby;
+        } else if (sLobbyRole == 1 && type == T_HELLO && !(n >= 12 && memcmp(pkt + 8, &kVersion, 4) == 0)) {
             sLobbyOther = 1; /* someone with another release is trying: the window says so, and goes on waiting */
         } else if (sLobbyRole == 1 && type == T_HELLO) {
             uint32_t ack[3] = {MAGIC, T_HELLO_ACK, NET_VERSION};
             int k;
+            fprint_send(&from);
             for (k = 0; k < 3; k++) {
                 net_send(ack, sizeof(ack), &from);
             }
@@ -1549,11 +2144,13 @@ void Port_LobbyLaunch(void);
 /* BT3_LOBBY=host or BT3_LOBBY=join:CODE: the room-code lobby driven without its window, once a blank (tests; the
    code and each change of state are written to the log). BT3_RELAY_ONLY=1: the one who joins tries nothing but the
    host's relay address. */
+static void lobby_background(void);
 void Port_LobbyAuto(void) {
     static int state = -99, begun, coded;
     const char *what = getenv("BT3_LOBBY");
     int now;
 
+    lobby_background();
     if (what == NULL || begun == 2 || Port_NetSession()) {
         return;
     }
@@ -1571,6 +2168,14 @@ void Port_LobbyAuto(void) {
                 Port_NetOptions(Port_RollCan() ? 8 : 0, -2); /* (and a quick match's fixed rollback and delay, as the window sets them) */
             }
             Port_LobbyStartQuick(q);
+        } else if (strncmp(what, "direct:", 7) == 0) { /* BT3_LOBBY=direct:<port> hosts, direct:<address>:<port> joins */
+            char addr[128];
+            int port;
+            if (sscanf(what + 7, "%127[^:]:%d", addr, &port) == 2) {
+                Port_LobbyStart(0, addr, port);
+            } else {
+                Port_LobbyStart(1, NULL, atoi(what + 7));
+            }
         } else {
             Port_LobbyStartCode(strncmp(what, "join:", 5) != 0, strncmp(what, "join:", 5) == 0 ? what + 5 : "");
         }
@@ -1615,7 +2220,8 @@ void Port_LobbyLaunch(void) {
 
 /* For the meter (ui.cpp). 0 when no match is on; else out = ping in ms (-1 not known yet), going back per second,
    blanks per going back x 10, waits per second, ms waited per second, the rollback limit (0: waiting for each
-   other), the input delay. */
+   other), the input delay, whether it is chosen from the ping, why the waits of the last second were (1: the other
+   game behind, 2: nothing came), the blank the two games came apart at (0: they agree). */
 int Port_NetStats(int *out) {
     if (sMode <= 0 || !sConnected) {
         return 0;
@@ -1628,10 +2234,71 @@ int Port_NetStats(int *out) {
     out[5] = sRollMax;
     out[6] = sDelay;
     out[7] = sAutoDelay;
+    out[8] = sShown[5];        /* why this copy waited in the last second (WHY_*), 0 for no wait worth naming */
+    out[9] = (int)sApartAt;    /* the blank at which the two games came apart, 0 for not */
     return 1;
 }
 
 /* 1 while a copy of another release is trying to join the lobby this copy hosts. */
 int Port_LobbyOther(void) {
     return sLobbyOther;
+}
+
+/* ---- Tenkaichi Budokai Online (menu/port_tbo.c), the game's own screens for the room-code lobby ----
+   The player's name is kept in online_name.txt beside the program. "Train While Waiting": the screens are left with
+   the room still open; from then on Port_LobbyAuto (each blank) polls it, and when the other player comes the
+   session begins wherever the game is (it starts from the game's first moment anyway). */
+static int sLobbyBg;
+
+const char *Port_NetNameGet(void) {
+    static int loaded;
+    if (!loaded) {
+        FILE *f = fopen("online_name.txt", "rb");
+        loaded = 1;
+        if (f != NULL) {
+            char line[64] = "";
+            size_t n = fread(line, 1, sizeof(line) - 1, f);
+            fclose(f);
+            line[n] = 0;
+            line[strcspn(line, "\r\n")] = 0;
+            if (line[0] != 0) {
+                Port_NetNameSet(line);
+            }
+        }
+    }
+    return sMyName;
+}
+
+void Port_NetNameSave(const char *name) {
+    FILE *f;
+    Port_NetNameSet(name);
+    f = fopen("online_name.txt", "wb");
+    if (f != NULL) {
+        fputs(sMyName, f);
+        fclose(f);
+    }
+}
+
+void Port_LobbyBackground(int on) {
+    sLobbyBg = on;
+}
+
+int Port_LobbyInBackground(void) {
+    return sLobbyBg;
+}
+
+static void lobby_background(void) {
+    int now;
+    if (!sLobbyBg || Port_NetSession()) {
+        return;
+    }
+    now = Port_LobbyPoll();
+    if (now == 2) {
+        sLobbyBg = 0;
+        Port_UiNotice("Tenkaichi Budokai Online: your opponent is here! The match begins.");
+        Port_LobbyLaunch();
+    } else if (now <= 0) {
+        sLobbyBg = 0;
+        Port_UiNotice(now == -3 ? Port_LobbyError() : "Tenkaichi Budokai Online: the room was closed.");
+    }
 }

@@ -7,6 +7,8 @@
 /* Windows: the exception code, the faulting address and the return addresses on the stack. The program is linked
    at a fixed address (0x20000000), so the numbers can be looked up in bt3.exe.map of the same build. */
 #include <windows.h>
+#include <io.h>
+#include <wchar.h>
 #include <stdint.h>
 #include <stdio.h>
 extern const char *Port_DataSummary(void); /* plat_verify.c */
@@ -124,6 +126,24 @@ __attribute__((constructor(101))) static void crash_init(void) {
     if (GetStdHandle(STD_OUTPUT_HANDLE) == NULL && AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "w", stdout);
         freopen("CONOUT$", "w", stderr);
+    } else if (GetStdHandle(STD_ERROR_HANDLE) == NULL) {
+        /* Started from the Explorer or a shortcut: no terminal and no pipe, and what the program says would be lost.
+           It goes to bt3_log.txt next to the program instead (the run before kept as bt3_log_prev.txt), so that a
+           report can carry it. Nothing when that folder cannot be written. */
+        wchar_t path[MAX_PATH + 32], prev[MAX_PATH + 32];
+        DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
+        while (n > 0 && path[n - 1] != L'\\' && path[n - 1] != L'/') {
+            n--;
+        }
+        if (n > 0) {
+            wcscpy(path + n, L"bt3_log.txt");
+            wcscpy(prev, path);
+            wcscpy(prev + n, L"bt3_log_prev.txt");
+            MoveFileExW(path, prev, MOVEFILE_REPLACE_EXISTING);
+            if (_wfreopen(path, L"w", stderr) != NULL) {
+                _dup2(_fileno(stderr), _fileno(stdout));
+            }
+        }
     }
     /* nothing held back in a buffer: what was printed before a crash is in the log */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -144,6 +164,26 @@ static void put(int fd, const char *s) {
     }
 }
 
+#ifdef __APPLE__
+/* macOS: the address that was reached, and the same as a game address (port_addr.h): a game address used without
+   its conversion shows here as an address below 4 GB, which macOS never maps. */
+#include "port_addr.h"
+#include <sys/ucontext.h>
+static void *sFault;
+static ucontext_t *sCtx;
+static void put_hex(int fd, unsigned long long v) {
+    char b[19];
+    int i;
+    b[0] = '0';
+    b[1] = 'x';
+    for (i = 0; i < 16; i++) {
+        b[2 + i] = "0123456789abcdef"[(v >> (60 - 4 * i)) & 15];
+    }
+    b[18] = '\0';
+    put(fd, b);
+}
+#endif
+
 static void on_crash(int sig) {
     void *frames[48];
     int n = backtrace(frames, 48), fd = open("bt3_crash.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644), k;
@@ -161,6 +201,29 @@ static void on_crash(int sig) {
             put(out, "\n");
             put(out, Port_DataSummary());
         }
+#ifdef __APPLE__
+        put(out, "\naddress ");
+        put_hex(out, (unsigned long long)(uintptr_t)sFault);
+        put(out, " (game address ");
+        put_hex(out, (unsigned long long)(uint32_t)((uintptr_t)sFault - PORT_WINDOW));
+        put(out, ")");
+        if (sCtx != NULL) { /* the registers when it happened: pc is the instruction (the backtrace starts above it) */
+            int r;
+            put(out, "\npc ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__pc);
+            put(out, " lr ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__lr);
+            put(out, " sp ");
+            put_hex(out, sCtx->uc_mcontext->__ss.__sp);
+            for (r = 0; r < 29; r++) {
+                put(out, r % 4 == 0 ? "\n" : " ");
+                put(out, "x");
+                put(out, (const char[]){(char)('0' + r / 10), (char)('0' + r % 10), 0});
+                put(out, " ");
+                put_hex(out, sCtx->uc_mcontext->__ss.__x[r]);
+            }
+        }
+#endif
         put(out, "\nbacktrace (innermost first):\n");
         backtrace_symbols_fd(frames, n, out);
     }
@@ -172,12 +235,28 @@ static void on_crash(int sig) {
     raise(sig);
 }
 
+#ifdef __APPLE__
+static void on_crash_info(int sig, siginfo_t *si, void *ctx) {
+    sCtx = (ucontext_t *)ctx;
+    sFault = si->si_addr;
+    on_crash(sig);
+}
+#endif
+
 __attribute__((constructor)) static void crash_init(void) {
     static const int sigs[] = {SIGSEGV, SIGFPE, SIGILL, SIGBUS, SIGABRT};
     unsigned i;
 
     for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+#ifdef __APPLE__
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = on_crash_info;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(sigs[i], &sa, NULL);
+#else
         signal(sigs[i], on_crash);
+#endif
     }
 }
 #endif

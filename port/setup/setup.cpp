@@ -34,6 +34,7 @@ struct Missing { std::string name, why, pkg; };
 static const char *kSourceSteps[] = {"Requirements", "Disc image", "Game data", "Executable data", "Build", "Self-test"};
 static const char *kReleaseSteps[] = {"Disc image", "Game data", "Self-test"};
 static const struct { const char *title, *help; } kHelp[] = {
+    {"European languages", "Spanish, German, French and Italian from the European disc"},
     {"Requirements", "Compilers and tools on this computer"}, {"Disc image", "Your disc image is read and checked"},
     {"Game data", "Models, sounds and text are unpacked"}, {"Executable data", "The data tables of the game's programs"},
     {"Build", "The port is compiled (a few minutes)"}, {"Self-test", "The game's demo fight, without a window"}};
@@ -57,6 +58,12 @@ static SDL_GLContext sGl;
 static bool sUseGl;
 static Page sPage = PAGE_PICK;
 static char sIso[1024];
+// Optional: a disc image of the European release (SLES-54945), for Spanish, German, French and Italian. The game is
+// always set up from the USA one; from this one only the languages' archive entries are taken (native.cpp step_eu,
+// install.py --eu-iso).
+static char sIsoEu[1024];
+static bool sEuOnly;    // only the languages are added (the game was set up before: the "Ready to play" page)
+static int sDialogFor;  // which field the file dialog fills: 0 the USA image, 1 the European one
 static std::string sRoot, sError, sLauncher, sLine;
 static std::vector<StepRow> sRows;
 static std::vector<Missing> sMissing;
@@ -114,17 +121,29 @@ static void style() {
 
 // ---------------------------------------------------------------------------------------------- the engine script
 
+// The rows as the run numbers its steps: the European languages, when asked for, before the self-test (native.cpp
+// work, install.py main); only them when they are added to a game set up before.
 static void reset_rows() {
-    size_t n = sRelease ? sizeof(kReleaseSteps) / sizeof(kReleaseSteps[0]) : sizeof(kSourceSteps) / sizeof(kSourceSteps[0]);
-    sRows.assign(n, StepRow());
-    for (size_t i = 0; i < n; i++) {
-        sRows[i].title = sRelease ? kReleaseSteps[i] : kSourceSteps[i];
+    std::vector<std::string> titles;
+    if (sRelease) {
+        titles.assign(kReleaseSteps, kReleaseSteps + sizeof(kReleaseSteps) / sizeof(kReleaseSteps[0]));
+    } else {
+        titles.assign(kSourceSteps, kSourceSteps + sizeof(kSourceSteps) / sizeof(kSourceSteps[0]));
+    }
+    if (sEuOnly) {
+        titles.assign(1, "European languages");
+    } else if (sIsoEu[0] != '\0') {
+        titles.insert(titles.end() - 1, "European languages");
+    }
+    sRows.assign(titles.size(), StepRow());
+    for (size_t i = 0; i < titles.size(); i++) {
+        sRows[i].title = titles[i];
     }
 }
 
 static void start_install() {
-    static std::string iso;
-    const char *args[8];
+    static std::string iso, euIso;
+    const char *args[10];
     SDL_PropertiesID props = SDL_CreateProperties();
     std::string script = sRoot + "install.py";
     int n = 0;
@@ -137,7 +156,7 @@ static void start_install() {
         sLauncher.clear();
         sRunStart = SDL_GetTicks();
         sNative = true;
-        Native_Start(sRoot, sIso);
+        Native_Start(sRoot, sEuOnly ? "" : sIso, sIsoEu);
         sPage = PAGE_RUN;
         return;
     }
@@ -147,6 +166,11 @@ static void start_install() {
     args[n++] = "--machine";
     args[n++] = "--iso";
     args[n++] = iso.c_str();
+    if (sIsoEu[0] != '\0') {
+        euIso = sIsoEu;
+        args[n++] = "--eu-iso";
+        args[n++] = euIso.c_str();
+    }
     if (getenv("BT3_SETUP_ARGS") != NULL) { // one extra argument for testing, such as --skip-test
         args[n++] = getenv("BT3_SETUP_ARGS");
     }
@@ -309,10 +333,11 @@ static void pump_install() {
 // --------------------------------------------------------------------------------------------------------- pages
 
 static void SDLCALL dialog_done(void *userdata, const char *const *files, int filter) {
-    (void)userdata; (void)filter;
+    (void)filter;
     std::lock_guard<std::mutex> lock(sDialogLock);
     if (files != NULL && files[0] != NULL) {
         sDialogResult = files[0];
+        sDialogFor = userdata != NULL; // (NULL: the USA image's field)
         sDialogReady = true;
     }
 }
@@ -350,6 +375,27 @@ static void bottom_row(int buttons) {
     ImGui::SetCursorPos(ImVec2(ImGui::GetCursorPosX() + avail.x - w, ImGui::GetCursorPosY() + avail.y - 40.0f));
 }
 
+// The European disc image's field (optional). Returns false when something is in it that is not a file.
+static bool eu_field() {
+    static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
+    ImGui::Dummy(ImVec2(0.0f, 6.0f));
+    ImGui::TextUnformatted("European disc image (optional)");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 130.0f);
+    ImGui::InputTextWithHint("##isoeu", "the European release (SLES-54945)", sIsoEu, sizeof(sIsoEu));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse...##eu", ImVec2(120.0f, 0.0f))) {
+        SDL_ShowOpenFileDialog(dialog_done, (void *)1, sWindow, filters, 2, NULL, false);
+    }
+    if (sIsoEu[0] != '\0' && !file_exists(sIsoEu)) {
+        ImGui::TextColored(kRed, "That file does not exist.");
+        return false;
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("Adds Spanish, German, French and Italian: menus, battle screen and text, as the European release has them. F1 > UI > Language picks one.");
+    ImGui::PopStyleColor();
+    return true;
+}
+
 static void page_pick() {
     static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
     bool ok = file_exists(sIso);
@@ -373,12 +419,14 @@ static void page_pick() {
     } else {
         ImGui::TextColored(kDim, sRelease ? "Needs about 4 GB of free space and takes a minute or two." : "Needs about 4 GB of free space and takes 5 to 10 minutes.");
     }
+    bool euOk = eu_field();
     bottom_row(2);
     if (big_button("Close", false)) {
         sQuit = true;
     }
     ImGui::SameLine();
-    if (big_button("Install", true, ok && !sRoot.empty())) {
+    if (big_button("Install", true, ok && euOk && !sRoot.empty())) {
+        sEuOnly = false;
         start_install();
     }
 }
@@ -465,6 +513,14 @@ static void page_done() {
     step_list();
     ImGui::Dummy(ImVec2(0.0f, 4.0f));
     ImGui::TextColored(kDim, "In the game, F1 opens the settings: resolution, widescreen, controls and sound.");
+    if (sRelease && !Native_EuInstalled(sRoot)) { // the languages can be added at any time
+        static const SDL_DialogFileFilter filters[] = {{"PS2 disc image", "iso;bin;img"}, {"All files", "*"}};
+        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+        ImGui::TextWrapped("Spanish, German, French and Italian: add a disc image of the European release (SLES-54945).");
+        if (ImGui::Button("Add languages...")) {
+            SDL_ShowOpenFileDialog(dialog_done, (void *)1, sWindow, filters, 2, NULL, false);
+        }
+    }
     bottom_row(2);
     if (big_button("Close", false)) {
         sQuit = true;
@@ -603,6 +659,43 @@ static void shot(ImDrawData *dd, Uint32 w, Uint32 h, int number) {
     SDL_ReleaseGPUTexture(sDevice, tex);
 }
 
+#ifdef _WIN32
+// The few functions of Windows used below, declared here: its headers define names this file has (FAILED, ...).
+extern "C" {
+__declspec(dllimport) wchar_t *__stdcall GetCommandLineW(void);
+__declspec(dllimport) wchar_t **__stdcall CommandLineToArgvW(const wchar_t *line, int *count);
+__declspec(dllimport) int __stdcall WideCharToMultiByte(unsigned page, unsigned long flags, const wchar_t *wide, int wideLen, char *out, int outLen,
+                                                        const char *def, int *usedDef);
+__declspec(dllimport) void *__stdcall LocalFree(void *mem);
+}
+
+// The program's arguments in UTF-8. Those main() gets on Windows are in the system's code page: a disc image whose
+// path has letters outside it arrives with '?' in their place, and one with letters inside it as bytes that are not
+// UTF-8, which is what SDL opens files by. Either way the image was "not found". NULL when Windows gives none.
+static char **utf8_args(int *count) {
+    int n = 0;
+    wchar_t **wide = CommandLineToArgvW(GetCommandLineW(), &n);
+    char **out = wide != NULL ? (char **)SDL_calloc((size_t)n + 1, sizeof(char *)) : NULL;
+
+    for (int i = 0; out != NULL && i < n; i++) {
+        int len = WideCharToMultiByte(65001 /* CP_UTF8 */, 0, wide[i], -1, NULL, 0, NULL, NULL);
+        out[i] = (char *)SDL_calloc((size_t)(len > 0 ? len : 1), 1);
+        if (out[i] == NULL) {
+            out = NULL; // (out of memory at start-up: main's own arguments are used)
+            break;
+        }
+        if (len > 0) {
+            WideCharToMultiByte(65001, 0, wide[i], -1, out[i], len, NULL, NULL);
+        }
+    }
+    if (wide != NULL) {
+        LocalFree(wide);
+    }
+    *count = n;
+    return out;
+}
+#endif
+
 int main(int argc, char **argv) {
     static const char *fonts[] = {
         "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -612,8 +705,19 @@ int main(int argc, char **argv) {
     ImGui_ImplSDLGPU3_InitInfo info;
     int shots = 0, shotKey = -1;
 
+#ifdef _WIN32
+    {
+        int count = 0;
+        char **args = utf8_args(&count); // (kept for the whole run)
+        if (args != NULL) {
+            argc = count;
+            argv = args;
+        }
+    }
+#endif
     if (argc > 2 && strcmp(argv[1], "--install") == 0) {
-        // Without a window: Tenkaichi3Decomp-setup --install <disc.iso>. A release folder only; prints the event lines.
+        // Without a window: Tenkaichi3Decomp-setup --install <disc.iso> [<European disc.iso>] (an empty first one: only
+        // the languages, for a folder set up before). A release folder only; prints the event lines.
         std::string line;
         bool ok = false;
         SDL_Init(0);
@@ -622,7 +726,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, GAME "-setup --install works in a release folder (" GAME " and " GAME ".dat next to it).\nIn a source checkout: python3 install.py --iso <file>\n");
             return 2;
         }
-        Native_Start(sRoot, argv[2]);
+        Native_Start(sRoot, argv[2], argc > 3 ? argv[3] : "");
         for (bool last = false; !last;) {
             last = !Native_Running(); // one more round after the worker has ended: nothing is left behind
             while (Native_Poll(line)) {
@@ -694,6 +798,9 @@ int main(int argc, char **argv) {
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.IniFilename = NULL;
+    // The keyboard reaches every control: Tab and the arrows move, Space or Enter presses. Without this, Tab stops at
+    // the text field only and no button can be pressed without a mouse.
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     style();
     for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
         if (file_exists(fonts[i])) {
@@ -724,6 +831,9 @@ int main(int argc, char **argv) {
     if (argc > 1) {
         SDL_strlcpy(sIso, argv[1], sizeof(sIso));
     }
+    if (getenv("BT3_SETUP_EU_ISO") != NULL) { // (testing, with BT3_SETUP_ISO: the European image too)
+        SDL_strlcpy(sIsoEu, getenv("BT3_SETUP_EU_ISO"), sizeof(sIsoEu));
+    }
     if (getenv("BT3_SETUP_ISO") != NULL) {
         SDL_strlcpy(sIso, getenv("BT3_SETUP_ISO"), sizeof(sIso));
         if (!sRoot.empty() && file_exists(sIso)) {
@@ -737,14 +847,23 @@ int main(int argc, char **argv) {
             if (ev.type == SDL_EVENT_QUIT || ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 sQuit = true;
             } else if (ev.type == SDL_EVENT_DROP_FILE && sPage == PAGE_PICK && ev.drop.data != NULL) {
-                SDL_strlcpy(sIso, ev.drop.data, sizeof(sIso));
+                // (into the USA image's field, unless that one is filled already: then into the European one's)
+                if (file_exists(sIso) && strcmp(sIso, ev.drop.data) != 0) {
+                    SDL_strlcpy(sIsoEu, ev.drop.data, sizeof(sIsoEu));
+                } else {
+                    SDL_strlcpy(sIso, ev.drop.data, sizeof(sIso));
+                }
             }
         }
         {
             std::lock_guard<std::mutex> lock(sDialogLock);
             if (sDialogReady) {
-                SDL_strlcpy(sIso, sDialogResult.c_str(), sizeof(sIso));
+                SDL_strlcpy(sDialogFor ? sIsoEu : sIso, sDialogResult.c_str(), sDialogFor ? sizeof(sIsoEu) : sizeof(sIso));
                 sDialogReady = false;
+                if (sDialogFor && sPage == PAGE_DONE && sRelease && !Native_Running()) { // "Add languages...": only that step
+                    sEuOnly = true;
+                    start_install();
+                }
             }
         }
         pump_install();

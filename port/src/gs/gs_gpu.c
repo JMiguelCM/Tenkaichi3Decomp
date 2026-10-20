@@ -29,6 +29,8 @@ extern int Port_AspectMilli(void);
 
 static SDL_Window *sWindow; /* the shared window (GsDraw_WindowCreate) */
 static SDL_GPUDevice *sDev;
+static SDL_GPUTextureFormat sDepthFormat = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+static int sShadowStencil;
 static SDL_GPUShader *sVs, *sFs, *sFsNz; /* (Nz: gs.frag without its depth output, key bit 23) */
 static SDL_GPUBuffer *sVbuf;
 static SDL_GPUTransferBuffer *sVxfer;
@@ -61,13 +63,22 @@ static int sPendingCount;
 
 static uint64_t gpu_now(void) { return SDL_GetTicksNS(); }
 
+#ifdef __APPLE__ /* Metal: the shaders as MSL (undefined.py translates the SPIR-V with spirv-cross, entry point main0) */
+#define SHADER_FORMAT SDL_GPU_SHADERFORMAT_MSL
+#define SHADER_ENTRY "main0"
+#define SHADER_CODE(name) name##Msl, sizeof(name##Msl) - 1
+#else
+#define SHADER_FORMAT SDL_GPU_SHADERFORMAT_SPIRV
+#define SHADER_ENTRY "main"
+#define SHADER_CODE(name) name##Spv, sizeof(name##Spv)
+#endif
 static SDL_GPUShader *shader(const unsigned char *code, size_t size, SDL_GPUShaderStage stage, int samplers, int ubos) {
     SDL_GPUShaderCreateInfo ci;
     SDL_zero(ci);
     ci.code = code;
     ci.code_size = size;
-    ci.entrypoint = "main";
-    ci.format = SDL_GPU_SHADERFORMAT_SPIRV;
+    ci.entrypoint = SHADER_ENTRY;
+    ci.format = SHADER_FORMAT;
     ci.stage = stage;
     ci.num_samplers = (Uint32)samplers;
     ci.num_uniform_buffers = (Uint32)ubos;
@@ -106,7 +117,7 @@ static void target_ensure(int i) {
     sTgCol[i] = SDL_CreateGPUTexture(sDev, &ci);
     ci.format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
     sTgAux[i] = SDL_CreateGPUTexture(sDev, &ci);
-    ci.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    ci.format = sDepthFormat;
     ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER; /* the depth effects read it */
     sTgDep[i] = SDL_CreateGPUTexture(sDev, &ci);
 }
@@ -210,6 +221,9 @@ static void blend_from_key(uint32_t bkey, SDL_GPUColorTargetBlendState *b) {
     for (i = 0; i < 2; i++) {
         f[i] = k[i] == 0 ? SDL_GPU_BLENDFACTOR_ZERO : k[i] == 1 || k[i] == 5 ? SDL_GPU_BLENDFACTOR_ONE : k[i] == 4 ? fi : fc;
     }
+    if (bkey & (1u << 9)) {
+        f[0] = SDL_GPU_BLENDFACTOR_ONE; /* (the shader scaled the source by its alpha: gs_draw.c, blend_key) */
+    }
     b->enable_blend = true;
     b->src_color_blendfactor = f[0];
     b->dst_color_blendfactor = f[1];
@@ -220,8 +234,9 @@ static void blend_from_key(uint32_t bkey, SDL_GPUColorTargetBlendState *b) {
 }
 
 /* Creates the pipeline of a key (everything a pipeline depends on is in the key):
-   bits 0..8 blend, 10..11 depth test, 12 depth write, 13..14 topology, 16..19 colour write mask,
-   20..21 vertices: 0 GS vertices, 1 program 0, 2 program 4, 3 program 6, 23 gs.frag without its depth output. */
+   bits 0..9 blend, 10..11 depth test, 12 depth write, 13..14 topology, 16..19 colour write mask,
+   20..21 vertices: 0 GS vertices, 1 program 0, 2 program 4, 3 program 6, 23 gs.frag without its depth output,
+   24 the flat-shadow stencil test. */
 static int pipeline_create(uint32_t key, int remember) {
     int ztst = (int)((key >> 10) & 3), zwrite = (int)((key >> 12) & 1), topo = (int)((key >> 13) & 3), vu = (int)((key >> 20) & 3);
     int fx = (int)((key >> 22) & 1); /* a full-screen table pass (dclut.frag): no vertices, no depth attachment */
@@ -240,7 +255,7 @@ static int pipeline_create(uint32_t key, int remember) {
     SDL_zero(at);
     SDL_zero(cds);
     cds[0].format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-    blend_from_key(key & 0x1FF, &cds[0].blend_state);
+    blend_from_key(key & 0x3FF, &cds[0].blend_state);
     cds[0].blend_state.color_write_mask = (SDL_GPUColorComponentFlags)wmask;
     cds[0].blend_state.enable_color_write_mask = true;
     vb.slot = 0;
@@ -268,13 +283,26 @@ static int pipeline_create(uint32_t key, int remember) {
     ci.depth_stencil_state.enable_depth_write = zwrite;
     ci.depth_stencil_state.compare_op = ztst == 0 ? SDL_GPU_COMPAREOP_NEVER : ztst == 1 ? SDL_GPU_COMPAREOP_ALWAYS :
                                         ztst == 2 ? SDL_GPU_COMPAREOP_GREATER_OR_EQUAL : SDL_GPU_COMPAREOP_GREATER;
+    if (key & (1u << 24)) {
+        SDL_GPUStencilOpState op;
+        SDL_zero(op);
+        op.fail_op = SDL_GPU_STENCILOP_KEEP;
+        op.depth_fail_op = SDL_GPU_STENCILOP_KEEP;
+        op.pass_op = SDL_GPU_STENCILOP_INCREMENT_AND_CLAMP;
+        op.compare_op = SDL_GPU_COMPAREOP_EQUAL;
+        ci.depth_stencil_state.front_stencil_state = op;
+        ci.depth_stencil_state.back_stencil_state = op;
+        ci.depth_stencil_state.compare_mask = 0xff;
+        ci.depth_stencil_state.write_mask = 0xff;
+        ci.depth_stencil_state.enable_stencil_test = true;
+    }
     /* the exact alpha byte: never blended, written whenever the frame's alpha is writable */
     cds[1].format = SDL_GPU_TEXTUREFORMAT_R8_UNORM;
     cds[1].blend_state.color_write_mask = (wmask & SDL_GPU_COLORCOMPONENT_A) ? SDL_GPU_COLORCOMPONENT_R : 0;
     cds[1].blend_state.enable_color_write_mask = true;
     ci.target_info.color_target_descriptions = cds;
     ci.target_info.num_color_targets = 2;
-    ci.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    ci.target_info.depth_stencil_format = sDepthFormat;
     ci.target_info.has_depth_stencil_target = true;
     if (fx) {
         ci.vertex_shader = sFxVs;
@@ -316,6 +344,7 @@ static void pipelines_preload(void) {
         return;
     }
     while (fscanf(f, "%x", &key) == 1) {
+        if (!sShadowStencil) { key &= ~(1u << 24); }
         for (i = 0; i < sPipeCount && sPipes[i].key != key; i++) {
         }
         if (i == sPipeCount && (key & ~0x7FF7FFFu) == 0) {
@@ -330,6 +359,7 @@ static void pipelines_preload(void) {
 /* The pipeline of a key gs_draw.c derived from GS state: cached here, created on first sight. */
 static int pipe_get(uint32_t key) {
     int i;
+    if (!sShadowStencil) { key &= ~(1u << 24); }
     for (i = 0; i < sPipeCount; i++) {
         if (sPipes[i].key == key) {
             return i;
@@ -372,13 +402,20 @@ static int vk_init(void) {
     SDL_GPUBufferCreateInfo bi;
     SDL_GPUTransferBufferCreateInfo ti;
     static uint32_t white = 0xFFFFFFFFu;
+    const char *gpuName = NULL;
     int i;
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "bt3: SDL_Init: %s\n", SDL_GetError());
         return 0;
     }
-    sDev = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, getenv("BT3_GPU_DEBUG") != NULL, NULL);
+    sDev = SDL_CreateGPUDevice(SHADER_FORMAT, getenv("BT3_GPU_DEBUG") != NULL, NULL);
+    sShadowStencil = sDev != NULL && SDL_GPUTextureSupportsFormat(sDev, SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT,
+        SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER);
+    sDepthFormat = sShadowStencil ? SDL_GPU_TEXTUREFORMAT_D32_FLOAT_S8_UINT : SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    if (sDev != NULL && !sShadowStencil) {
+        fprintf(stderr, "bt3: shadow stencil unavailable; flat shadows may show overlapping model parts\n");
+    }
     sWindow = GsDraw_WindowCreate(0); /* the shared window: shape, display and full screen decided there */    if (sWindow == NULL || !SDL_ClaimWindowForGPUDevice(sDev, sWindow)) {
         fprintf(stderr, "bt3: no GPU window: %s\n", SDL_GetError());
         return 0;
@@ -386,9 +423,9 @@ static int vk_init(void) {
     /* The game paces itself at 30 frames per second; waiting for the display's own refresh on top of that
        (VSYNC) costs up to a refresh period per frame. Prefer MAILBOX (no tearing, no wait), then IMMEDIATE. */
     vsync_apply(Port_Setting("vsync", 0)); /* (the setting "V-sync" asks for the wait all the same) */
-    sVs = shader(kGsVertSpv, sizeof(kGsVertSpv), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
-    sFs = shader(kGsFragSpv, sizeof(kGsFragSpv), SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
-    sFsNz = shader(kGsnzFragSpv, sizeof(kGsnzFragSpv), SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
+    sVs = shader(SHADER_CODE(kGsVert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
+    sFs = shader(SHADER_CODE(kGsFrag), SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
+    sFsNz = shader(SHADER_CODE(kGsnzFrag), SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
     if (sVs == NULL || sFs == NULL || sFsNz == NULL) {
         fprintf(stderr, "bt3: shaders: %s\n", SDL_GetError());
         return 0;
@@ -416,9 +453,9 @@ static int vk_init(void) {
         si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         sSamplers[i] = SDL_CreateGPUSampler(sDev, &si);
     }
-    sVu0Vs = shader(kVu0VertSpv, sizeof(kVu0VertSpv), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-    sVu4Vs = shader(kVu4VertSpv, sizeof(kVu4VertSpv), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-    sVu6Vs = shader(kVu6VertSpv, sizeof(kVu6VertSpv), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+    sVu0Vs = shader(SHADER_CODE(kVu0Vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+    sVu4Vs = shader(SHADER_CODE(kVu4Vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
+    sVu6Vs = shader(SHADER_CODE(kVu6Vert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
     bi.size = MAX_VU_VERTS * 48;
     sVuVbuf = SDL_CreateGPUBuffer(sDev, &bi);
     ti.size = MAX_VU_VERTS * 48;
@@ -447,8 +484,8 @@ static int vk_init(void) {
         sPendingCount++;
     }
     {   /* native outline: destination minus source on the colour channels */
-        SDL_GPUShader *vs = sFxVs = shader(kFxVertSpv, sizeof(kFxVertSpv), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
-        SDL_GPUShader *fs = shader(kOutlineFragSpv, sizeof(kOutlineFragSpv), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
+        SDL_GPUShader *vs = sFxVs = shader(SHADER_CODE(kFxVert), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
+        SDL_GPUShader *fs = shader(SHADER_CODE(kOutlineFrag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1);
         SDL_GPUColorTargetDescription cd;
         SDL_GPUGraphicsPipelineCreateInfo ci;
         SDL_zero(cd);
@@ -476,7 +513,7 @@ static int vk_init(void) {
             return 0;
         }
         /* native alpha key: the tint blended by its own alpha, colour channels only */
-        fs = shader(kAlphakeyFragSpv, sizeof(kAlphakeyFragSpv), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
+        fs = shader(SHADER_CODE(kAlphakeyFrag), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
         cd.blend_state.src_color_blendfactor = SDL_GPU_BLENDFACTOR_SRC_ALPHA;
         cd.blend_state.dst_color_blendfactor = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         cd.blend_state.color_blend_op = SDL_GPU_BLENDOP_ADD;
@@ -487,9 +524,17 @@ static int vk_init(void) {
             return 0;
         }
     }
-    sDclutFs = shader(kDclutFragSpv, sizeof(kDclutFragSpv), SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1);
+    sDclutFs = shader(SHADER_CODE(kDclutFrag), SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1);
     copies_create();
-    if (!Ui_Init(sWindow, sDev, NULL)) {
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+    {   /* the graphics card's name, for F1 > Video */
+        SDL_PropertiesID props = SDL_GetGPUDeviceProperties(sDev);
+        if (props != 0) {
+            gpuName = SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, NULL);
+        }
+    }
+#endif
+    if (!Ui_Init(sWindow, sDev, NULL, gpuName)) {
         fprintf(stderr, "bt3: the settings window could not be set up\n");
     }
     fprintf(stderr, "bt3: GPU renderer: %s\n", SDL_GetGPUDeviceDriver(sDev));
@@ -522,10 +567,24 @@ static void vk_frame_end(void) {
         vsync_apply(sVsyncPending);
         sVsyncPending = -1;
     }
+    {   /* "Low input lag" (plat_stub.c): no more than one picture may be on its way to the screen at a time (the
+           library allows two by default, which is a picture more of delay whenever the graphics chip or V-sync
+           is what paces the game). BT3_FRAMES_IN_FLIGHT=<1..3> overrides. */
+        extern int Port_LateInput(void);
+        static int have = -1;
+        int want = getenv("BT3_FRAMES_IN_FLIGHT") != NULL ? atoi(getenv("BT3_FRAMES_IN_FLIGHT")) : Port_LateInput() ? 1 : 2;
+        want = want < 1 ? 1 : want > 3 ? 3 : want;
+        if (want != have) {
+            have = want;
+            SDL_SetGPUAllowedFramesInFlight(sDev, (Uint32)want);
+        }
+    }
+    { extern void Port_LagMark(int what); Port_LagMark('E'); }
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_EVENT_QUIT) {
             exit(0);
         }
+        { extern void PortA11y_Event(const SDL_Event *ev); PortA11y_Event(&ev); } /* a11y.c: the repeat key and button */
         if (PortInput_Hotkey(&ev)) { /* F1, START + SELECT, or what the settings window's list says */
             Ui_Toggle();
             continue;
@@ -717,6 +776,7 @@ static void vk_frame_end(void) {
         SDL_GPUTextureSamplerBinding ts;
         SDL_FColor bc;
         struct { int32_t mode[4]; float misc[4]; float rect[4]; float orig[4]; float extra[4]; } fu;
+        int shadowStart;
 
         if (d->native >= 100) { /* a picture uploaded into this display buffer (GsGpu_FbUpload): scaled into its texture */
             SDL_GPUBlitInfo bl;
@@ -864,6 +924,14 @@ static void vk_frame_end(void) {
             pass = NULL;
             continue;
         }
+        shadowStart = (sPipes[d->pipeline].key & (1u << 24)) != 0 &&
+            (n == 0 || gsDraws[n - 1].native || gsDraws[n - 1].target != d->target ||
+             (sPipes[gsDraws[n - 1].pipeline].key & (1u << 24)) == 0);
+        if (shadowStart && pass != NULL) {
+            SDL_EndGPURenderPass(pass);
+            pass = NULL;
+            cur = -1;
+        }
         if (d->target != cur) {
             SDL_GPUColorTargetInfo ct, cts[2];
             SDL_GPUDepthStencilTargetInfo dt;
@@ -881,11 +949,14 @@ static void vk_frame_end(void) {
             dt.texture = sTgDep[d->target];
             dt.load_op = gsTargets[d->target].cleared ? SDL_GPU_LOADOP_LOAD : SDL_GPU_LOADOP_CLEAR;
             dt.store_op = SDL_GPU_STOREOP_STORE;
-            dt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+            /* Shadow batches stay in this pass. The mask has no use after it, so avoid
+               loading or storing stencil on all the other render passes. */
+            dt.stencil_load_op = shadowStart ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_DONT_CARE;
             dt.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
             gsTargets[d->target].cleared = 1;
             cts[0] = ct;
             pass = SDL_BeginGPURenderPass(cmd, cts, 2, &dt);
+            if (sShadowStencil) { SDL_SetGPUStencilReference(pass, 0); }
             cur = d->target;
             bound = -1;
             lastPipe = lastUni = lastSampler = -1; /* a new pass: everything is set again */
@@ -932,6 +1003,7 @@ static void vk_frame_end(void) {
         memcpy(fu.rect, d->rect, sizeof(fu.rect));
         memcpy(fu.orig, d->orig, sizeof(fu.orig));
         fu.extra[0] = d->vu ? (gsVuUni[d->uniform].misc[2] > 0.0f ? gsVuUni[d->uniform].misc[2] : 0.0f) : gsZMax;
+        fu.extra[1] = (sPipes[d->pipeline].key & (1u << 9)) ? 1.0f : 0.0f; /* the source scaled by its alpha */
         if (!haveFu || memcmp(&fu, &lastFu, sizeof(fu)) != 0) {
             SDL_PushGPUFragmentUniformData(cmd, 0, &fu, sizeof(fu));
             memcpy(&lastFu, &fu, sizeof(fu));
@@ -1076,7 +1148,7 @@ static void vk_frame_end(void) {
         }
     }
     sEndT[4] = gpu_now();
-    SDL_SubmitGPUCommandBuffer(cmd);
+    SDL_SubmitGPUCommandBuffer(cmd); { extern void Port_LagMark(int what); Port_LagMark('S'); }
     {   /* BT3_GS_VERBOSE: once a second, where the end of the frame spends its time */
         static uint64_t sum[5];
         static int count;
@@ -1214,7 +1286,7 @@ static int vk_target_read(int i, uint8_t *rgba) {
     dst.transfer_buffer = tb;
     SDL_DownloadFromGPUTexture(cp, &src, &dst);
     SDL_EndGPUCopyPass(cp);
-    fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd); { extern void Port_LagMark(int what); Port_LagMark('S'); }
     SDL_WaitForGPUFences(sDev, true, &fence, 1);
     SDL_ReleaseGPUFence(sDev, fence);
     px = SDL_MapGPUTransferBuffer(sDev, tb, false);
@@ -1247,7 +1319,7 @@ static void vk_target_copy(int src, int dst) {
     bl.load_op = SDL_GPU_LOADOP_DONT_CARE;
     bl.filter = SDL_GPU_FILTER_NEAREST;
     SDL_BlitGPUTexture(cmd, &bl);
-    SDL_SubmitGPUCommandBuffer(cmd);
+    SDL_SubmitGPUCommandBuffer(cmd); { extern void Port_LagMark(int what); Port_LagMark('S'); }
 }
 
 GsBackend sVulkanBackend = {
